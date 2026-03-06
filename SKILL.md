@@ -11,9 +11,9 @@ A unified entry point for task capture and processing.
 
 **Actions:**
 
-- **do**: Capture new tasks/requests → creates UR folder (verbatim input) + REQ files (queue items), always paired
-- **work**: Process pending requests → executes the queue
-- **verify**: Evaluate captured REQs against original input → quality check
+- **do**: Capture new tasks/requests → creates UR folder (verbatim input) + REQ files (queue items), always paired, then verifies coverage
+- **work**: Process pending requests → plans (with plan verification), explores, builds, tests
+- **verify**: Evaluate captured REQs against original input → coverage check with auto-fix (also runs automatically after capture)
 - **cleanup**: Consolidate archive → moves loose REQs into UR folders, closes completed URs
 
 > **Core concept:** The do action always produces both a UR folder (preserving the original input) and REQ files (the queue items). Each REQ links back to its UR via `user_request` frontmatter. This pairing is mandatory for all requests — simple or complex.
@@ -148,7 +148,8 @@ Follow the detailed instructions in:
 
 - [do action](./actions/do.md) - Request capture
 - [work action](./actions/work.md) - Queue processing
-- [verify action](./actions/verify.md) - Quality evaluation of captured requests
+- [verify-request action](./actions/verify-request.md) - Coverage verification of captured requests (runs after capture, or manually)
+- [verify-plan action](./actions/verify-plan.md) - Plan coverage verification (runs after planning in the work action)
 - [cleanup action](./actions/cleanup.md) - Archive consolidation and UR closure
 - [version action](./actions/version.md) - Version, updates & changelog
 

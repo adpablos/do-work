@@ -4,6 +4,31 @@ What's new, what's better, what's different. Most recent stuff on top.
 
 ---
 
+## 0.12.0 — The Proportional Planner (2026-03-06)
+
+Planning is no longer gated by complexity. Every request gets a plan — the plan just scales to the task. A config change gets a one-liner. A new feature gets a multi-step strategy. Routes A/B/C still exist as complexity labels for retrospective analysis, but they no longer decide whether planning happens. verify-plan and exploration follow the same principle: they run based on the plan's content, not on a pre-hoc routing decision.
+
+- Planning is mandatory for all routes — plan depth scales to complexity assessment
+- Route labels (A/B/C) are now complexity hints for the planner, not workflow forks
+- verify-plan runs on all routes (consistent quality gate regardless of complexity)
+- Exploration is driven by plan content (references unknown files/patterns) instead of route
+- Architecture diagram simplified to linear flow: triage -> plan -> verify -> explore? -> implement -> test
+- Implementation prompts consolidated from three route variants to two (with/without exploration)
+- Complexity Triage section renamed to Complexity Assessment, reframed as calibration not gating
+
+## 0.11.0 — The Coverage Report (2026-03-06)
+
+Verification is no longer a suggestion -- it's baked into the workflow. After capturing requests, the do action now automatically verifies every REQ against the original input: enumerates items, maps coverage, auto-fixes gaps, and stores the metrics. The work action does the same for plans -- after Route C planning, every plan gets verified against its REQ before exploration begins. Both use the same Coverage Analysis Protocol (enumerate, map, calculate, fix, store) so the measurement is consistent end-to-end. Skip it if you want ("skip verification"), but by default it runs.
+
+- Split `verify.md` into `verify-request.md` (input -> REQs) and `verify-plan.md` (REQ -> plan)
+- Added Coverage Analysis Protocol: enumerate source items, map to target, calculate %, auto-fix, store results
+- verify-request runs automatically after do action creates REQ files (Step 5.5)
+- verify-plan runs automatically after work action planning phase (Step 4.5, Route C only)
+- Both auto-fix gaps instead of just reporting them -- coverage repair is the default behavior
+- Coverage metrics stored in REQ files for traceability (available to downstream actions)
+- Both skippable with "skip verification" in user input
+- Updated work action architecture diagram, progress reporting, checklists, and examples
+
 ## 0.10.0 — The Hard Stop (2026-02-16)
 
 Capture no longer slides into execution. The do action now has an explicit boundary: after writing files and reporting back, it stops. No helpful "let me go ahead and start building that for you." The user decides when to run the queue — always. Both SKILL.md (routing level) and do.md (action level) enforce this, so even eager agents get the message.

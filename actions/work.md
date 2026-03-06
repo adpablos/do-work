@@ -2,17 +2,18 @@
 
 > **Part of the do-work skill.** Invoked when routing determines the user wants to process the queue. Processes requests from the `do-work/` folder in your project.
 
-An orchestrated build system that processes request files created by the do action. Uses complexity triage to avoid unnecessary overhead - simple requests go straight to implementation, complex ones get planning and exploration first.
+An orchestrated build system that processes request files created by the do action. Every request gets planned, verified, and implemented — the plan's depth scales to the task, from a single line for config changes to a multi-step strategy for new features.
 
 ## Request Files as Living Logs
 
 **Each request file becomes a complete historical record of the work performed.** As you process a request, you append sections documenting each phase:
 
-1. **Triage** - Route decision and reasoning
-2. **Plan** - Either the full plan (Route C) or "Planning not required" (Routes A/B)
-3. **Exploration** - Codebase findings (Routes B/C)
-4. **Implementation Summary** - What was changed
-5. **Testing** - Test results and coverage
+1. **Triage** - Complexity assessment and route label
+2. **Plan** - Implementation plan (depth scales to complexity)
+3. **Plan Verification** - Coverage analysis of plan against requirements
+4. **Exploration** - Codebase findings (when plan indicates)
+5. **Implementation Summary** - What was changed
+6. **Testing** - Test results and coverage
 
 This traceability ensures:
 - You can review what was planned vs what was done
@@ -27,36 +28,34 @@ work action (orchestrator - lightweight, stays in loop)
   │
   ├── For each pending request:
   │     │
-  │     ├── TRIAGE: Assess complexity (no agent, just read & categorize)
-  │     │     │
-  │     │     ├── Route A (Simple) ──────────────────┐
-  │     │     │   Skip plan/explore, direct to build │
-  │     │     │                                      │
-  │     │     ├── Route B (Medium) ───────┐          │
-  │     │     │   Explore only, then build│          │
-  │     │     │                           ▼          │
-  │     │     └── Route C (Complex) ──► Plan ──► Explore
-  │     │                                            │
-  │     │                                            ▼
-  │     └─────────────────────────────────────► general-purpose agent
-  │                                             (executes implementation)
+  │     ├── TRIAGE: Assess complexity → label (A/B/C)
+  │     │
+  │     ├── PLAN: Proportional to complexity (1 line → multi-step)
+  │     │
+  │     ├── VERIFY PLAN: Coverage analysis against requirements
+  │     │
+  │     ├── EXPLORE: When plan references unknown files/patterns
+  │     │
+  │     ├── IMPLEMENT: general-purpose agent (has plan + optional exploration)
+  │     │
+  │     └── TEST: Run and verify tests
   │
   └── Loop continues until queue empty
 ```
 
-The orchestrator stays lightweight - it triages requests and only spawns the agents actually needed.
+Every request flows through the same pipeline. The complexity label (A/B/C) tells the planner how deep to go — it does not gate whether planning happens.
 
 ## Sub-agent Compatibility
 
 This document uses "spawn agent" language. Use your platform's subagent or multi-agent mechanism when available. If your tool does not support subagents, run the phases sequentially in the same session and clearly label outputs as Plan, Explore, and Implementation summaries.
 
-## Complexity Triage
+## Complexity Assessment
 
-Before spawning any agents, quickly assess the request to determine the right route.
+Before spawning any agents, quickly assess the request's complexity. This produces a **route label** (A/B/C) that tells the planner how deep to go. The label is for calibration, not gating — every request gets planned and verified regardless of route.
 
-### Route A: Direct to Builder (Simple)
+### Route A: Simple
 
-Skip planning and exploration entirely. The builder agent has these tools available if needed.
+The plan should be 1-3 lines. Exploration is unlikely to be needed.
 
 **Indicators:**
 - Bug fix with clear reproduction steps or error message
@@ -75,9 +74,9 @@ Skip planning and exploration entirely. The builder agent has these tools availa
 - "Update the API timeout from 30s to 60s"
 - "Remove the deprecated banner from the header"
 
-### Route B: Explore then Build (Medium)
+### Route B: Medium
 
-Skip planning but run exploration. The "what" is clear, but we need to find the "where" or existing patterns.
+The plan should include steps for discovering patterns/locations. Exploration will likely be needed.
 
 **Indicators:**
 - Clear outcome but unspecified location
@@ -92,9 +91,9 @@ Skip planning but run exploration. The "what" is clear, but we need to find the 
 - "Add the same loading state we use elsewhere"
 - "Fix the styling to match the rest of the settings panel"
 
-### Route C: Full Pipeline (Complex)
+### Route C: Complex
 
-Run planning, then exploration, then implementation.
+The plan should be detailed with multiple steps, dependencies, and a testing approach. Exploration is almost certainly needed.
 
 **Indicators:**
 - New feature requiring multiple components
@@ -113,31 +112,30 @@ Run planning, then exploration, then implementation.
 - "Add real-time sync between devices"
 - "Improve the search performance"
 
-### Triage Decision Flow
+### Assessment Decision Flow
 
 ```
 Read the request file
      │
      ├── Does it name specific files AND have clear changes?
-     │     └── Yes → Route A (Direct)
+     │     └── Yes → Route A (Simple)
      │
      ├── Is it a bug fix with clear reproduction?
-     │     └── Yes → Route A (Direct)
+     │     └── Yes → Route A (Simple)
      │
      ├── Is it a simple value/config/copy change?
-     │     └── Yes → Route A (Direct)
+     │     └── Yes → Route A (Simple)
      │
      ├── Is the outcome clear but location/pattern unknown?
-     │     └── Yes → Route B (Explore only)
+     │     └── Yes → Route B (Medium)
      │
      ├── Is it ambiguous, multi-system, or architectural?
-     │     └── Yes → Route C (Full pipeline)
+     │     └── Yes → Route C (Complex)
      │
-     └── Default: Route B (Explore only)
-         Builder can request planning if needed
+     └── Default: Route B (Medium)
 ```
 
-**When uncertain, prefer Route B.** The implementation agent (or single-agent flow) can still switch into a planning phase if it determines one is needed. Under-planning is recoverable; over-planning is wasted time.
+**When uncertain, prefer Route B.** The planner will calibrate depth based on the label, and verify-plan catches any gaps regardless. Getting the label slightly wrong is low-cost because every route gets the same quality gates.
 
 ## Folder Structure
 
@@ -292,7 +290,7 @@ claimed_at: 2025-01-26T10:30:00Z
 
 **[Orchestrator action - do this yourself]**
 
-Read the request content and apply the triage decision flow. Update frontmatter with the chosen route:
+Read the request content and apply the assessment decision flow. Update frontmatter with the chosen route:
 
 ```yaml
 ---
@@ -311,30 +309,32 @@ route: B
 
 **Route: [A/B/C]** - [Simple/Medium/Complex]
 
-**Reasoning:** [1-2 sentences explaining why this route was chosen]
-
-**Planning:** [Required/Not required]
+**Reasoning:** [1-2 sentences explaining why this complexity label was chosen]
 ```
 
 Examples:
-- Route A: "Route A - Simple. Bug fix with clear reproduction steps. Planning not required - direct implementation."
-- Route B: "Route B - Medium. Clear feature but need to find existing patterns. Planning not required - exploration then implementation."
-- Route C: "Route C - Complex. New feature spanning multiple systems. Planning required."
+- Route A: "Route A - Simple. Bug fix with clear reproduction steps and named file."
+- Route B: "Route B - Medium. Clear feature but need to find existing patterns."
+- Route C: "Route C - Complex. New feature spanning multiple systems with dependencies."
 
-This creates a record for retrospective analysis - you can later review whether triage decisions were appropriate.
+This creates a record for retrospective analysis - you can later evaluate whether complexity assessments were accurate by comparing the route label to the plan depth and actual time spent.
 
 **The request file is a living log** - every phase of work gets documented in it so there's full traceability of what happened.
 
-Report the triage decision briefly to the user:
-- Route A: "Simple request, going direct to implementation (no planning needed)"
-- Route B: "Clear request, exploring codebase first (no planning needed)"
-- Route C: "Complex request, starting with planning"
+Report the assessment briefly to the user:
+- Route A: "Simple request — planning will be lightweight"
+- Route B: "Medium complexity — will plan and likely explore codebase"
+- Route C: "Complex request — detailed planning ahead"
 
-### Step 4: Planning Phase (Route C only, or document skip for Routes A/B)
+### Step 4: Planning Phase (All routes)
 
-**[Spawn agent for Route C, or document skip for Routes A/B]**
+**[Spawn agent — plan depth scales to complexity]**
 
-**For Route C - Full Planning:**
+Every request gets a plan. The route label from triage tells the planner how deep to go:
+
+- **Route A**: Plan should be 1-3 lines. Name the file(s) and the change. Don't over-think it.
+- **Route B**: Plan should identify what needs to be found/matched, plus the implementation steps.
+- **Route C**: Plan should be detailed — files, ordering, dependencies, architecture decisions, testing approach.
 
 Spawn a **Plan agent** with this prompt structure:
 
@@ -345,21 +345,23 @@ You are planning the implementation for this request:
 [Full content of the request file]
 ---
 
+Complexity assessment: Route [A/B/C] - [Simple/Medium/Complex]
+
 Project context:
 - This is a [describe project type based on package.json/Cargo.toml]
 - Key directories: [list from exploring project structure]
 
-Create a detailed implementation plan that includes:
-1. What files need to be created or modified
-2. The order of changes (dependencies between steps)
-3. Any architectural decisions needed
-4. Testing approach
+Create an implementation plan proportional to the complexity:
+- Route A (Simple): 1-3 lines. Name the file(s) and what changes. That's it.
+- Route B (Medium): Identify patterns to match or locations to find, plus implementation steps.
+- Route C (Complex): Detailed plan with files, ordering, dependencies, architecture decisions, and testing approach.
 
 Be specific about file paths and function names where possible.
+If your plan includes steps that require finding unknown files or discovering
+existing patterns, note them clearly — these signal that exploration is needed.
 ```
 
 **After Plan agent returns:**
-- Update request status to `exploring`
 - Store the plan output for the next phase
 - **Write the plan into the request file** (append after Triage section):
 
@@ -371,29 +373,43 @@ Be specific about file paths and function names where possible.
 *Generated by Plan agent*
 ```
 
-**For Routes A and B - Document that planning was skipped:**
+### Step 4.5: Verify Plan (All routes)
 
-Even when planning is not performed, document this in the request file for traceability:
+**[Mandatory step -- runs automatically after planning]**
 
-```markdown
-## Plan
+Run the verify-plan action on the plan that was just generated. This ensures the plan addresses every requirement in the REQ before moving to exploration and implementation.
 
-**Planning not required** - [Route A: Direct implementation / Route B: Exploration-guided implementation]
+**What this does:**
+1. Enumerates discrete items from the REQ (and cross-references the UR input for safety)
+2. Maps each item to the plan steps
+3. Calculates coverage percentage
+4. Auto-fixes the plan with any missing items (adds steps or expands existing ones)
+5. Stores the verification results in the REQ file as a `## Plan Verification` section (immediately after `## Plan`)
 
-Rationale: [Brief explanation, e.g., "Simple bug fix with clear scope" or "Clear feature, just need to find existing patterns"]
+See [verify-plan action](./verify-plan.md) for the full protocol.
 
-*Skipped by work action*
-```
+**Skip condition:** If the user said "skip verification" in their original request, skip this step.
 
-This preserves the full workflow history - you can always see what the plan said was needed (or why planning was skipped), compare it to what was actually done, and evaluate planning quality over time.
+**After verification completes:**
+- The plan in the REQ file has been updated to cover any gaps
+- A `## Plan Verification` section documents the coverage metrics
+- The exploration and implementation phases receive a more complete plan
 
-### Step 5: Exploration Phase (Routes B and C)
+For Route A plans (1-3 lines), verification will be fast — a simple task has few items to enumerate. The value is consistency: every request gets the same quality gate.
 
-**[Spawn agent, then orchestrator writes results to file]**
+### Step 5: Exploration Phase (When plan indicates)
+
+**[Spawn agent if plan references unknown files/patterns, then orchestrator writes results to file]**
+
+Since every request now has a plan, the plan itself signals whether exploration is needed:
+
+- **Exploration needed:** The plan references patterns to match, files to discover, or conventions to follow without naming specific paths. Plan steps like "find where X is implemented" or "match existing Y pattern" are clear signals.
+- **Exploration not needed:** The plan names specific files and exact changes. There's nothing to discover.
+
+When in doubt, explore. The cost is low and the context it provides helps the builder.
 
 Spawn an **Explore agent** with this prompt:
 
-**For Route C (has plan):**
 ```
 Based on this implementation plan:
 
@@ -405,7 +421,7 @@ For this request:
 [Brief summary of the request]
 
 Find and read the relevant files that will need to be modified or that contain patterns we should follow. Focus on:
-1. Files explicitly mentioned in the plan
+1. Files mentioned or implied by the plan
 2. Similar existing implementations we should match
 3. Type definitions and interfaces we'll need
 4. Test files that show testing patterns
@@ -416,27 +432,10 @@ Return a summary of what you found, including:
 - Any concerns or blockers discovered
 ```
 
-**For Route B (no plan):**
-```
-For this request:
-
----
-[Full content of request file]
----
-
-Find the relevant files and patterns needed to implement this. Focus on:
-1. Where this change should be made
-2. Similar existing implementations to follow
-3. Related types/interfaces
-4. Testing patterns if applicable
-
-Return a summary of what you found with specific file paths and code patterns.
-```
-
 **After Explore agent returns:**
 - Update request status to `implementing`
 - Store the exploration output for the next phase
-- **Write exploration findings into the request file** (append after Plan section if present, or after Triage):
+- **Write exploration findings into the request file** (append after Plan Verification section):
 
 ```markdown
 ## Exploration
@@ -446,98 +445,84 @@ Return a summary of what you found with specific file paths and code patterns.
 *Generated by Explore agent*
 ```
 
+**If exploration is skipped** (plan is fully specified), document it:
+
+```markdown
+## Exploration
+
+**Not needed** -- plan names specific files and changes. No discovery required.
+
+*Skipped by work action*
+```
+
 ### Step 6: Implementation Phase (All routes)
 
 **[Spawn agent - agent does the actual code changes]**
 
-Spawn a **general-purpose agent** with context appropriate to the route:
+Every request now has a plan (and optionally exploration context). Spawn a **general-purpose agent** with the appropriate context:
 
-**Route A (direct):**
+**With exploration context:**
 ```
 You are implementing this request:
 
 ## Request
 [Full content of request file]
 
-## Instructions
-
-Implement this change. You have full access to edit files and run shell commands, and can use Explore or Plan phases if you discover you need more context.
-
-Key guidelines:
-- This was triaged as a simple request - aim for a focused, minimal change
-- If you find the request is more complex than expected, you can use Plan or Explore agents
-- If you encounter blockers, document them clearly
-
-Testing requirements:
-- If the project has tests, identify tests related to your changes
-- Write new tests for new functionality or bug fixes (regression tests)
-- Update existing tests if behavior intentionally changed
-- Note what tests exist and what new tests may be needed
-
-When complete, provide a summary of:
-- What was changed
-- What tests exist for this code
-- What new tests should be written (if any)
-```
-
-**Route B (explored):**
-```
-You are implementing this request:
-
-## Request
-[Full content of request file]
+## Implementation Plan
+[Plan from Step 4]
 
 ## Codebase Context
 [Output from Explore agent]
 
 ## Instructions
 
-Implement the changes using the patterns and locations identified above. You have full access to edit files and run shell commands.
+Implement the changes according to the plan, using the patterns and locations
+identified in the codebase context. You have full access to edit files and
+run shell commands.
 
 Key guidelines:
 - Follow existing code patterns identified in the codebase context
 - Make minimal, focused changes
 - If you encounter blockers, document them clearly
+- If you deviate from the plan, note why
 
 Testing requirements:
-- If the project has tests, identify tests related to your changes
+- Identify existing tests related to the changes
 - Write new tests for new functionality, following patterns from the codebase context
 - For bug fixes, add regression tests that would have caught the bug
 - Update existing tests if behavior intentionally changed
 
 When complete, provide a summary of:
-- What was changed
-- What tests exist for this code
-- What new tests were written or need to be written
+1. What files were changed/created
+2. Any deviations from the plan and why
+3. What tests exist and what new tests were written
+4. Any follow-up items needed
 ```
 
-**Route C (planned + explored):**
+**Without exploration context (exploration was skipped):**
 ```
 You are implementing this request:
 
-## Original Request
+## Request
 [Full content of request file]
 
 ## Implementation Plan
-[Output from Plan agent]
-
-## Codebase Context
-[Output from Explore agent]
+[Plan from Step 4]
 
 ## Instructions
 
-Implement the changes according to the plan. You have full access to edit files and run shell commands.
+Implement the changes according to the plan. You have full access to edit
+files and run shell commands, including exploring the codebase if you need
+additional context.
 
 Key guidelines:
-- Follow existing code patterns identified in the codebase context
 - Make minimal, focused changes
 - If you encounter blockers, document them clearly
+- If you deviate from the plan, note why
 
 Testing requirements:
-- Identify existing tests related to the changes
-- Write new tests for new functionality, following patterns from the codebase context
-- Include tests as part of the implementation, not as an afterthought
-- For each new component/function/endpoint, include corresponding tests
+- If the project has tests, identify tests related to your changes
+- Write new tests for new functionality or bug fixes (regression tests)
 - Update existing tests if behavior intentionally changed
 
 When complete, provide a summary of:
@@ -771,15 +756,21 @@ commit: a1b2c3d
 
 **Reasoning:** Clear feature but need to find existing component patterns.
 
-**Planning:** Not required
-
 ## Plan
 
-**Planning not required** - Route B: Exploration-guided implementation
+1. Find existing component patterns in src/components/ (similar to avatar)
+2. Create UserAvatar component following discovered patterns
+3. Add to user profile section
+4. Add tests matching existing component test patterns
 
-Rationale: Clear feature request with well-defined outcome. Just need to discover existing component patterns to match.
+*Generated by Plan agent*
 
-*Skipped by work action*
+## Plan Verification
+
+**Source**: REQ-007 (3 items enumerated)
+**Pre-fix coverage**: 100% (3/3 items addressed)
+
+*Verified by verify-plan action*
 
 ## Exploration
 
@@ -807,7 +798,7 @@ Rationale: Clear feature request with well-defined outcome. Just need to discove
 *Verified by work action*
 ```
 
-**All routes have a Plan section** - for Route C it contains the actual plan from the Plan agent, for Routes A and B it documents that planning was skipped and why. This ensures full traceability of the workflow decision.
+**All routes have Plan and Plan Verification sections.** The plan's depth scales to the complexity — one line for a config change, a full strategy for a new feature. The verification coverage is consistent regardless of plan size.
 
 **Timestamps tell the story:**
 - `created_at` → `claimed_at`: How long request sat in queue
@@ -922,8 +913,10 @@ Use this checklist to ensure you don't skip critical steps:
 □ Step 2: Update frontmatter: status: claimed, claimed_at: <timestamp>
 □ Step 3: Read request, decide route (A/B/C), update frontmatter with route
 □ Step 3: Append ## Triage section to request file (including Planning status)
-□ Step 4: Append ## Plan section (Route C: from Plan agent / Routes A,B: "Planning not required")
-□ Step 5: (Routes B,C) Spawn Explore agent, append ## Exploration section
+□ Step 4: Spawn Plan agent (depth scales to route), append ## Plan section
+□ Step 4.5: Run verify-plan — enumerate, map, fix plan, store coverage
+□ Step 5: If plan indicates exploration needed: Spawn Explore agent, append ## Exploration section
+□ Step 5: If plan is fully specified: Append "Exploration: Not needed" section
 □ Step 6: Spawn implementation agent
 □ Step 6.5: Run tests, append ## Testing section
 □ Step 7: Update frontmatter: status: completed, completed_at: <timestamp>
@@ -942,7 +935,8 @@ Use this checklist to ensure you don't skip critical steps:
 - Completing implementation without moving file to `archive/`
 - Forgetting to update status in frontmatter
 - Letting agents handle file management (they shouldn't)
-- Forgetting to document planning status for Routes A/B (write "Planning not required")
+- Skipping planning for simple requests (all routes get planned — the plan just scales down)
+- Skipping verify-plan (it's mandatory for all routes unless user said "skip verification")
 - Forgetting to check/archive related UR folders or legacy context documents
 - Archiving a UR folder before all its REQs are complete
 
@@ -956,6 +950,7 @@ Keep the user informed with brief updates:
 Processing REQ-003-dark-mode.md...
   Triage: Complex (Route C)
   Planning...     [done]
+  Verify Plan...  [done] 90% → 100% (2 items fixed)
   Exploring...    [done]
   Implementing... [done]
   Testing...      [done] ✓ 12 tests passing
@@ -964,6 +959,8 @@ Processing REQ-003-dark-mode.md...
 
 Processing REQ-004-fix-typo.md...
   Triage: Simple (Route A)
+  Planning...     [done] (1 line)
+  Verify Plan...  [done] 100%
   Implementing... [done]
   Testing...      [done] ✓ 3 tests passing
   Archiving...    [done]
@@ -973,6 +970,8 @@ Found 1 more pending request. Continuing...
 
 Processing REQ-005-add-tooltip.md...
   Triage: Simple (Route A)
+  Planning...     [done] (1 line)
+  Verify Plan...  [done] 100%
   Implementing... [done]
   Testing...      [done] ✓ 2 tests passing
   Archiving...    [done]
@@ -989,6 +988,7 @@ For non-Git projects, the commit step is skipped:
 Processing REQ-003-dark-mode.md...
   Triage: Complex (Route C)
   Planning...     [done]
+  Verify Plan...  [done] 100% (no fixes needed)
   Exploring...    [done]
   Implementing... [done]
   Testing...      [done] ✓ 8 tests passing
@@ -1000,11 +1000,11 @@ Completed.
 
 ## Error Handling
 
-### Plan agent fails (Route C)
+### Plan agent fails
 - Mark request as `failed` with error
 - Continue to next request (don't block the queue)
 
-### Explore agent fails (Routes B, C)
+### Explore agent fails
 - Proceed to implementation anyway with reduced context
 - Note the limitation in the implementation prompt
 - Builder can explore on its own if needed
@@ -1048,7 +1048,7 @@ Show what would be processed and their triage routes without making changes.
 - Run without user being present (this is supervised automation)
 - Modify requests that are already `completed` or `in_progress` by another agent
 - Allow external modification of files in `working/` or `archive/` — these are immutable to all actions except the work pipeline itself
-- Override triage decisions mid-flight (complete the request, then retry if needed)
+- Skip planning for any request, regardless of complexity (every request gets a plan)
 
 ## Example Session
 
@@ -1065,6 +1065,12 @@ Planning complete. Key steps:
   2. Create useTheme hook
   3. Add toggle to settings
   4. Update Tailwind config
+
+Verifying plan coverage...
+  Items: 8 enumerated from request
+  Pre-fix: 88% (7 full, 0 partial, 1 missing)
+  Fixed: Added Step 5 for system preference detection
+  Post-fix: 100%
 
 [Spawns Explore agent]
 Found relevant patterns:
@@ -1088,6 +1094,13 @@ Committed → abc1234
 Continuing with REQ-004-fix-submit-crash.md...
 Triage: Simple (Route A) - bug fix with clear reproduction
 
+[Spawns Plan agent]
+Plan: "Fix null check in src/components/Form.tsx handleSubmit(). Add regression test."
+
+Verifying plan coverage...
+  Items: 2 enumerated from request
+  Coverage: 100%
+
 [Spawns implementation agent]
 Implementation complete:
   - Fixed null check in src/components/Form.tsx:42
@@ -1102,6 +1115,13 @@ Committed → def5678
 Continuing with REQ-005-change-timeout.md...
 Triage: Simple (Route A) - config value change
 
+[Spawns Plan agent]
+Plan: "Update API_TIMEOUT in src/config.ts from 30000 to 60000."
+
+Verifying plan coverage...
+  Items: 1 enumerated from request
+  Coverage: 100%
+
 [Spawns implementation agent]
 Implementation complete:
   - Updated API_TIMEOUT in src/config.ts from 30000 to 60000
@@ -1112,9 +1132,9 @@ Archived REQ-005-change-timeout.md
 Committed → ghi9012
 
 All 3 requests completed:
-  - REQ-003: Route C (plan + explore + build) → abc1234
-  - REQ-004: Route A (direct build) → def5678
-  - REQ-005: Route A (direct build) → ghi9012
+  - REQ-003: Route C → abc1234
+  - REQ-004: Route A → def5678
+  - REQ-005: Route A → ghi9012
 ```
 
 ## Retrospective Value
@@ -1181,6 +1201,18 @@ Implement dark mode across the app.
 
 *Generated by Plan agent*
 
+## Plan Verification
+
+**Source**: REQ-003 (8 items enumerated)
+**Pre-fix coverage**: 88% (7 full, 0 partial, 1 missing)
+**Post-fix coverage**: 100% (8/8 items addressed)
+
+### Fixes Applied
+
+- Added Step 5: Detect and respect system color scheme preference
+
+*Verified by verify-plan action*
+
 ## Exploration
 
 - Existing stores in src/stores/ use Zustand pattern
@@ -1238,13 +1270,22 @@ Update the API timeout from 30s to 60s.
 
 **Reasoning:** Single config value change, file explicitly mentioned in request.
 
-**Planning:** Not required
-
 ## Plan
 
-**Planning not required** - Route A: Direct implementation
+Update API_TIMEOUT in src/config.ts from 30000 to 60000.
 
-Rationale: Simple config value change with explicit file mentioned. No architectural decisions needed.
+*Generated by Plan agent*
+
+## Plan Verification
+
+**Source**: REQ-005 (1 item enumerated)
+**Pre-fix coverage**: 100% (1/1 items addressed)
+
+*Verified by verify-plan action*
+
+## Exploration
+
+**Not needed** -- plan names specific file and change. No discovery required.
 
 *Skipped by work action*
 
@@ -1264,11 +1305,11 @@ Rationale: Simple config value change with explicit file mentioned. No architect
 
 This lets you:
 - Review what planning recommended vs what was actually done
-- Identify requests where triage was wrong (simple request that needed planning)
+- Identify requests where complexity assessment was off (plan depth vs actual effort)
 - Track patterns in request complexity over time
 - Debug failed requests by seeing what context was gathered
 - Analyze throughput: timestamps show queue wait time and implementation time
-- Calibrate triage: compare route assignment to actual time spent (Route A should be fast)
+- Calibrate assessments: compare route label to actual plan depth and time spent
 
 **Git integration benefits (when applicable):**
 - **Rollback**: `git revert <commit>` undoes one complete request

@@ -645,6 +645,25 @@ batch: auth-system
 ---
 ```
 
+### Step 5.5: Verify Requests
+
+**[Mandatory step -- runs automatically after file creation]**
+
+Run the verify-request action on the UR and REQ files you just created. This ensures coverage of the original input before reporting back to the user.
+
+**What this does:**
+1. Enumerates discrete items from the UR's verbatim input
+2. Maps each item to the REQ files you just created
+3. Calculates coverage percentage
+4. Auto-fixes any gaps (adds missing items to the appropriate REQ sections)
+5. Stores the verification results (coverage map + metrics) in each REQ file
+
+See [verify-request action](./verify-request.md) for the full protocol.
+
+**Skip condition:** If the user's input included "skip verification" or similar language, skip this step entirely.
+
+**After verification completes**, the REQ files now have a `## Verification` section appended with coverage metrics. These metrics are available to downstream actions (work, cleanup) and provide traceability for capture quality over time.
+
 ### Step 6: Report Back
 
 After creating files, give a brief summary:
@@ -654,24 +673,25 @@ After creating files, give a brief summary:
 
 Keep it concise. Don't explain your reasoning unless asked.
 
-#### Verify Hint for Complex Requests
+#### Include Verification Coverage
 
-If the request was **meaningfully complex**, suggest the verify action after your summary. A request is meaningfully complex when ANY of these are true:
+Since verify-request runs automatically in Step 5.5, include the coverage results in your report. After listing the created files, add the verification summary:
 
-- Complex mode was used (per the detection rules above)
-- 3 or more REQ files were created
-- The input was notably long or nuanced (lots of conditional logic, edge cases, firm constraints)
+```
+Verification: UR-NNN
+  Coverage: 95% (19/20 items) -> 100% after fixes
+  Fixed: 1 item in REQ-005
+```
 
-When the threshold is met, add a brief line after the file summary:
+If verification was skipped (user said "skip verification"), note it:
 
-> That was a pretty detailed request — it's possible the capture missed some nuances. You can run `/do-work verify` to check coverage against your original input.
+```
+Verification: skipped (user request)
+```
 
-**Don't suggest verify when:**
-- It's a simple, single-feature request
-- Only 1-2 straightforward REQs were created
-- The input was short and direct
+If the pre-fix coverage was below 75%, call it out so the user knows significant gaps were found and fixed:
 
-The goal is a gentle nudge, not a gate. One sentence, no pressure. If the user ignores it, that's fine.
+> Coverage was 65% on first pass -- several requirements from your input were missing from the REQs. Auto-fixed all gaps. You can run `/do-work verify` again to review the fixes.
 
 ### STOP After Capture
 
@@ -698,8 +718,8 @@ Use this to verify you haven't skipped a step:
 □ Create UR folder with input.md (Step 5)
 □ Create REQ file(s) with user_request: UR-NNN in frontmatter (Step 5)
 □ Update UR requests array with all REQ IDs (Step 5)
-□ Report created files to user (Step 6)
-□ Suggest verify if complex (Step 6)
+□ Run verify-request on created REQs — enumerate, map, fix, store (Step 5.5)
+□ Report created files to user, include verification coverage (Step 6)
 ```
 
 **Common mistakes:**
@@ -707,6 +727,7 @@ Use this to verify you haven't skipped a step:
 - Creating the UR folder but not setting `user_request` in REQ frontmatter
 - Skipping the UR for simple requests (it's required for ALL requests)
 - Not updating the UR's `requests` array after creating REQs
+- Skipping verify-request (it's mandatory unless the user said "skip verification")
 
 ## Examples
 
@@ -800,8 +821,8 @@ Created:
 
 All requests reference UR-001 for full requirements.
 
-That was a pretty detailed request — it's possible the capture missed some
-nuances. You can run `/do-work verify` to check coverage against your original input.
+Verification: UR-NNN
+  Coverage: 92% → 100% after fixes (2 items fixed)
 ```
 
 ### Example 7: Detecting Complexity
@@ -829,8 +850,8 @@ Created:
 
 Each request includes full detailed requirements and references UR-002.
 
-That was a pretty detailed request — it's possible the capture missed some
-nuances. You can run `/do-work verify` to check coverage against your original input.
+Verification: UR-NNN
+  Coverage: 92% → 100% after fixes (2 items fixed)
 ```
 
 ## What NOT To Do
