@@ -73,6 +73,8 @@ Round to the nearest integer. This is the pre-fix coverage score.
 
 ### Step 5: Auto-Fix the Plan
 
+**Fix the gaps directly. Do not ask the user for permission — just edit the plan.** The coverage map in Step 6 documents exactly what was changed, so nothing is hidden.
+
 For each missing or partial item:
 
 1. Determine where in the plan it should go:

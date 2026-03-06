@@ -87,16 +87,20 @@ Round to the nearest integer. This is the **pre-fix** coverage score.
 
 ### Step 7: Auto-Fix Gaps
 
+**Fix the gaps directly. Do not ask the user for permission — just make the edits.** The default behavior is to fix, not to report and wait. The coverage map in Step 8 documents exactly what was changed, so nothing is hidden.
+
 For each missing or partial item:
 
 1. Determine the most appropriate REQ file (by topic alignment)
 2. Determine the most appropriate section (Detailed Requirements for requirements, Constraints for constraints, Builder Guidance for intent signals, etc.)
-3. Add the missing content:
+3. **Edit the REQ file now** -- add the missing content:
    - **Missing items**: Add a new bullet point in the appropriate section
    - **Partial items**: Expand the existing bullet with the missing detail
 4. If no existing REQ is appropriate for an item, note it as a recommendation for a new REQ (don't create REQs -- that's the do action's job)
 
 **Don't expand beyond the source.** Only add what the user actually said. This is coverage repair, not requirements expansion.
+
+**Don't ask.** Don't say "Want me to apply these fixes?" or "Should I update the REQ?" Just do it. The whole point of auto-fix is that it's automatic.
 
 ### Step 8: Recalculate and Store
 

@@ -2,7 +2,7 @@
 
 > **Part of the do-work skill.** Handles version reporting and update checks.
 
-**Current version**: 0.12.0
+**Current version**: 0.12.1
 
 **Upstream**: https://raw.githubusercontent.com/bladnman/do-work/main/actions/version.md
 

@@ -649,20 +649,58 @@ batch: auth-system
 
 **[Mandatory step -- runs automatically after file creation]**
 
-Run the verify-request action on the UR and REQ files you just created. This ensures coverage of the original input before reporting back to the user.
-
-**What this does:**
-1. Enumerates discrete items from the UR's verbatim input
-2. Maps each item to the REQ files you just created
-3. Calculates coverage percentage
-4. Auto-fixes any gaps (adds missing items to the appropriate REQ sections)
-5. Stores the verification results (coverage map + metrics) in each REQ file
-
-See [verify-request action](./verify-request.md) for the full protocol.
+Verify the REQ files you just created against the UR's verbatim input. Fix any gaps. Store the results. Do not ask the user for permission — just fix and report.
 
 **Skip condition:** If the user's input included "skip verification" or similar language, skip this step entirely.
 
-**After verification completes**, the REQ files now have a `## Verification` section appended with coverage metrics. These metrics are available to downstream actions (work, cleanup) and provide traceability for capture quality over time.
+**1. Enumerate source items:**
+
+Re-read the UR's verbatim input. Extract a numbered list of every discrete requirement, constraint, behavior, UX detail, intent signal, and edge case the user mentioned. One item per line. If they said it, it counts — even passing mentions.
+
+**2. Map each item to the REQs:**
+
+For each enumerated item, find where it appears in the REQ files you just created. Classify each:
+- **Full** -- present with appropriate detail
+- **Partial** -- mentioned but missing specifics
+- **Missing** -- not in any REQ
+
+**3. Calculate coverage:**
+
+Coverage % = (full + 0.5 x partial) / total x 100
+
+**4. Auto-fix gaps (do not ask -- just fix):**
+
+For each missing or partial item, edit the appropriate REQ file directly:
+- Add missing items as bullet points in the most relevant section
+- Expand partial items with the missing detail
+- Don't invent requirements — only add what the user actually said
+
+**5. Store results — append to each REQ file:**
+
+```markdown
+## Verification
+
+**Source**: UR-NNN/input.md
+**Pre-fix coverage**: 85% (17/20 items)
+**Post-fix coverage**: 100% (20/20 items)
+
+### Coverage Map
+
+| # | Item | REQ Section | Status |
+|---|------|-------------|--------|
+| 1 | [item from input] | REQ-NNN [section] | Full |
+| 2 | [item from input] | REQ-NNN [section] | Partial -> Fixed |
+| 3 | [item from input] | -- | Missing -> Fixed |
+
+### Fixes Applied
+
+- REQ-NNN: Added "[requirement]" to [section]
+- REQ-NNN: Expanded "[requirement]" with [detail]
+
+*Verified by verify-request action*
+```
+
+See [verify-request action](./verify-request.md) for the full protocol (used when running verification manually via `do work verify`).
 
 ### Step 6: Report Back
 

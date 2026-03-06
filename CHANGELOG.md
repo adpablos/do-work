@@ -4,6 +4,16 @@ What's new, what's better, what's different. Most recent stuff on top.
 
 ---
 
+## 0.12.1 — The No-Ask Fix (2026-03-06)
+
+Verification was asking permission instead of just fixing, and the inline steps were hand-waves pointing to separate files. Agents need the actual instructions right where they're working, not a link to go read. Fixed for both verify-request (in do.md) and verify-plan (in work.md).
+
+- verify-request.md and verify-plan.md Step 5/7 now explicitly say "do not ask — just fix"
+- do.md Step 5.5 is now self-contained with full inline instructions (enumerate, map, calculate, fix, store)
+- work.md Step 4.5 is now self-contained with full inline instructions (same protocol)
+- Agents no longer need to read separate verify action files during the do/work workflows
+- Standalone verify files still exist for manual `do work verify` invocations
+
 ## 0.12.0 — The Proportional Planner (2026-03-06)
 
 Planning is no longer gated by complexity. Every request gets a plan — the plan just scales to the task. A config change gets a one-liner. A new feature gets a multi-step strategy. Routes A/B/C still exist as complexity labels for retrospective analysis, but they no longer decide whether planning happens. verify-plan and exploration follow the same principle: they run based on the plan's content, not on a pre-hoc routing decision.

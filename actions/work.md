@@ -377,25 +377,61 @@ existing patterns, note them clearly — these signal that exploration is needed
 
 **[Mandatory step -- runs automatically after planning]**
 
-Run the verify-plan action on the plan that was just generated. This ensures the plan addresses every requirement in the REQ before moving to exploration and implementation.
-
-**What this does:**
-1. Enumerates discrete items from the REQ (and cross-references the UR input for safety)
-2. Maps each item to the plan steps
-3. Calculates coverage percentage
-4. Auto-fixes the plan with any missing items (adds steps or expands existing ones)
-5. Stores the verification results in the REQ file as a `## Plan Verification` section (immediately after `## Plan`)
-
-See [verify-plan action](./verify-plan.md) for the full protocol.
+Verify the plan against the REQ to ensure every requirement is addressed. Fix any gaps in the plan directly. Do not ask the user — just fix and document.
 
 **Skip condition:** If the user said "skip verification" in their original request, skip this step.
 
-**After verification completes:**
-- The plan in the REQ file has been updated to cover any gaps
-- A `## Plan Verification` section documents the coverage metrics
-- The exploration and implementation phases receive a more complete plan
+**1. Enumerate source items:**
+
+Read the REQ file (in `do-work/working/`). Extract a numbered list of every discrete requirement, constraint, UX detail, dependency, and scope cue. Also read the UR input.md (via the REQ's `user_request` field) to catch anything that applies to this REQ but didn't make it into the REQ text.
+
+**2. Map each item to the plan:**
+
+For each enumerated item, find where the plan addresses it. Classify each:
+- **Full** -- the plan includes a step that clearly addresses this item
+- **Partial** -- the plan touches on this but doesn't fully address it
+- **Missing** -- the plan does not address this item at all
+
+**3. Calculate coverage:**
+
+Coverage % = (full + 0.5 x partial) / total x 100
+
+**4. Auto-fix the plan (do not ask -- just fix):**
+
+For each missing or partial item, edit the plan directly:
+- Missing feature? Add a new implementation step
+- Missing constraint? Add to an existing step or create a constraints note
+- Missing test coverage? Add to the testing approach
+- Keep additions proportional — don't bloat a simple plan for a minor constraint
+
+**5. Store results — append to REQ file immediately after the `## Plan` section:**
+
+```markdown
+## Plan Verification
+
+**Source**: REQ-NNN (X items enumerated)
+**Pre-fix coverage**: 80% (7 full, 2 partial, 1 missing)
+**Post-fix coverage**: 100% (10/10 items addressed)
+
+### Coverage Map
+
+| # | Requirement | Plan Step | Status |
+|---|------------|-----------|--------|
+| 1 | [requirement] | Step N: [description] | Full |
+| 2 | [requirement] | Step N: [description] | Partial -> Fixed |
+| 3 | [requirement] | -- | Missing -> Fixed (added Step N) |
+
+### Fixes Applied
+
+- Added Step N: [description]
+- Expanded Step N to include [detail]
+
+*Verified by verify-plan action*
+```
 
 For Route A plans (1-3 lines), verification will be fast — a simple task has few items to enumerate. The value is consistency: every request gets the same quality gate.
+
+See [verify-plan action](./verify-plan.md) for the full protocol.
 
 ### Step 5: Exploration Phase (When plan indicates)
 
