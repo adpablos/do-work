@@ -1,0 +1,6 @@
+# PRD drafts — local-only, deleted after `do work` captures them into a UR
+docs/prd/*.md
+!docs/prd/README.md
+
+# macOS
+.DS_Store

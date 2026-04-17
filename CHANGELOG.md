@@ -4,6 +4,16 @@ What's new, what's better, what's different. Most recent stuff on top.
 
 ---
 
+## 0.13.1 — The Drafts Drawer (2026-04-17)
+
+Set up a `docs/prd/` convention so this repo can dogfood itself — drop a PRD in there, run `do work`, watch it capture into `do-work/`. Drafts stay local (gitignored) because the UR folder is already the canonical record.
+
+- Added `docs/prd/README.md` documenting the draft-only convention
+- Added `.gitignore` that ignores `docs/prd/*.md` but keeps the folder's README tracked
+- No skill behavior change — infrastructure for meta/dogfooding work
+
+---
+
 ## 0.13.0 — The Fork (2026-04-17)
 
 Hard fork from [bladnman/do-work](https://github.com/bladnman/do-work). Same skill, new upstream — we're now iterating on concurrency-safety improvements (parallel sessions, atomic claims, clean commit scope) that are too invasive to upstream cleanly.
