@@ -2,7 +2,7 @@
 name: do-work
 description: Task queue - add requests or process pending work
 argument-hint: run | (task to capture) | verify | cleanup | version | changelog
-upstream: https://raw.githubusercontent.com/bladnman/do-work/main/SKILL.md
+upstream: https://raw.githubusercontent.com/adpablos/do-work/main/SKILL.md
 ---
 
 # Do-Work Skill

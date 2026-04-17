@@ -5,8 +5,10 @@ A task queue skill for agentic coding tools. Capture requests fast, process them
 ## Installation
 
 ```bash
-npx skills add bladnman/do-work
+npx skills add adpablos/do-work
 ```
+
+> This is a hard fork of [bladnman/do-work](https://github.com/bladnman/do-work) by Matt — all credit for the original skill goes to him. This fork exists to iterate on concurrency-safety improvements and ship our own flavor. See `CHANGELOG.md` for divergence from upstream.
 
 ## Welcome to your new work loop
 
@@ -119,4 +121,4 @@ See [actions/cleanup.md](./actions/cleanup.md) for the full consolidation logic.
 
 ## License
 
-MIT
+MIT — see [`LICENSE`](./LICENSE). Original copyright © Matt (bladnman); fork copyright © Alejandro de Pablos López (adpablos).

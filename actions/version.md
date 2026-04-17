@@ -2,9 +2,9 @@
 
 > **Part of the do-work skill.** Handles version reporting and update checks.
 
-**Current version**: 0.12.4
+**Current version**: 0.13.0
 
-**Upstream**: https://raw.githubusercontent.com/bladnman/do-work/main/actions/version.md
+**Upstream**: https://raw.githubusercontent.com/adpablos/do-work/main/actions/version.md
 
 ## Responding to Version Requests
 
@@ -28,7 +28,7 @@ When user asks "check for updates", "update", or "is there a newer version":
 Update available: v{remote} (you have v{local})
 
 To update, run:
-npx skills add bladnman/do-work -g -y
+npx skills add adpablos/do-work -g -y
 ```
 
 **If up to date** (local >= remote):
@@ -43,9 +43,9 @@ You're up to date (v{local})
 Couldn't check for updates.
 
 To manually update, run:
-npx skills add bladnman/do-work
+npx skills add adpablos/do-work
 
-Or visit: https://github.com/bladnman/do-work
+Or visit: https://github.com/adpablos/do-work
 ```
 
 ## Responding to Changelog Requests

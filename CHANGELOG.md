@@ -4,6 +4,17 @@ What's new, what's better, what's different. Most recent stuff on top.
 
 ---
 
+## 0.13.0 — The Fork (2026-04-17)
+
+Hard fork from [bladnman/do-work](https://github.com/bladnman/do-work). Same skill, new upstream — we're now iterating on concurrency-safety improvements (parallel sessions, atomic claims, clean commit scope) that are too invasive to upstream cleanly.
+
+- Upstream pointers retargeted to `adpablos/do-work` (SKILL.md, version action, README install command, update fallback URL)
+- Added `LICENSE` file with dual MIT copyright preserving Matt's original authorship
+- README now credits upstream and explains the fork's purpose
+- No behavior changes yet — parallel-safety work is queued and will land in future releases
+
+---
+
 ## 0.12.4 — The Resume (2026-03-07)
 
 Interrupted runs left requests stranded in `working/` — future runs skipped them, assuming another session was still active. Now `do work` automatically unclaims anything in `working/` that's been there over an hour before starting. `do work resume` does the same thing immediately, no age check — for when you know the session is gone and want to pick it back up now. Unclaimed requests move back to the queue with their existing plan sections intact.
