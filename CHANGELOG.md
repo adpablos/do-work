@@ -4,6 +4,16 @@ What's new, what's better, what's different. Most recent stuff on top.
 
 ---
 
+## 0.13.2 — The Hall of Mirrors (2026-04-17)
+
+Dogfooding the skill on itself has its own hazards — the code you're editing is the code that's running. Added a "meta-use" section to `docs/prd/README.md` with guardrails for when the PRD targets `do-work` itself.
+
+- Branch before capture, one REQ per session, smoke-test in a fresh session after each run
+- Reminder that the current session holds the *old* skill in prompt context until restart
+- Note that `verify-request` checks REQ-vs-PRD, not REQ-vs-live-code
+
+---
+
 ## 0.13.1 — The Drafts Drawer (2026-04-17)
 
 Set up a `docs/prd/` convention so this repo can dogfood itself — drop a PRD in there, run `do work`, watch it capture into `do-work/`. Drafts stay local (gitignored) because the UR folder is already the canonical record.
