@@ -4,6 +4,17 @@ What's new, what's better, what's different. Most recent stuff on top.
 
 ---
 
+## 0.13.3 — The First Dogfood (2026-04-17)
+
+First real meta-capture: the parallel-safety PRD became UR-001 with ten linked REQs, each mapping the PRD's failure modes and binding architectural decisions to a discrete piece of work. The draft is gone — the UR is now the source of truth — and the queue is sequenced so session identity and shared primitives land before any of the race fixes that depend on them.
+
+- Captured `docs/prd/do-work-parallel-safety.md` into `do-work/user-requests/UR-001/` + REQ-001 through REQ-010
+- Every REQ carries the five batch constraints (filesystem-only, session ID + heartbeat, fail-loud, claim + commit snapshot, shared primitives) as binding context
+- Draft PRD removed from `docs/prd/` per the "UR is canonical" convention
+- Work happening on branch `prd/parallel-safety` — trunk is not yet affected
+
+---
+
 ## 0.13.2 — The Hall of Mirrors (2026-04-17)
 
 Dogfooding the skill on itself has its own hazards — the code you're editing is the code that's running. Added a "meta-use" section to `docs/prd/README.md` with guardrails for when the PRD targets `do-work` itself.
