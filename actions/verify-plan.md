@@ -29,6 +29,10 @@ For simple tasks (Route A), the plan may be 1-3 lines and verification will be f
 
 ## Workflow
 
+### Step 0: Establish Session Identity
+
+Before reading or writing any file under `do-work/`, establish session identity per [actions/session-identity.md](./session-identity.md). verify-plan runs inside the work action's loop, so session identity was already established at work's Step 0 — refresh the heartbeat and proceed. If for any reason verify-plan is invoked standalone, establish a fresh session record before Step 1.
+
 ### Step 1: Read the REQ
 
 Read the request file currently being processed (in `do-work/working/`). This is the source document.

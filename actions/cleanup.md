@@ -11,7 +11,9 @@ The archive should be a collection of self-contained UR folders, each containing
 
 ## What It Does
 
-Three passes, in order:
+Before Pass 1, establish session identity per [actions/session-identity.md](./session-identity.md). Cleanup performs multiple folder moves; every one of those is a coordinated write and must not happen without a session record. If cleanup runs automatically at the end of a work loop, session identity was already established at work's Step 0 — refresh the heartbeat and proceed. If cleanup is invoked standalone (`do work cleanup`), establish a fresh session record before Pass 1.
+
+Then three passes, in order:
 
 ### Pass 1: Close Completed User Requests
 

@@ -392,6 +392,7 @@ The work action adds additional fields (`claimed_at`, `route`, `completed_at`) a
 
 ```
 Capture order:
+[ ] Step 0.5: Establish session identity per actions/session-identity.md
 [ ] Step 1:   Parse input — single vs. multiple requests
 [ ] Step 1.5: Assess complexity — simple or complex mode
 [ ] Step 2:   Check for existing requests — duplicates, addendums
@@ -403,6 +404,8 @@ Capture order:
 [ ] Step 5.5: *** MANDATORY *** Verify requests — enumerate items from UR input, map to REQs, fix gaps, append ## Verification to every REQ file
 [ ] Step 6:   Report back — include verification coverage, never report without it
 ```
+
+Step 0.5 is non-negotiable: no writes to `do-work/` happen before the session record exists. If the session-identity write fails, the capture must not proceed — fail loud per the session-identity protocol.
 
 Marking Step 5.5 as done means every REQ file you created has a `## Verification` section appended to it. If any file is missing this section, Step 5.5 is not complete — go back.
 

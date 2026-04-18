@@ -28,6 +28,12 @@ A coverage analysis system that enumerates items from the original user input an
 
 ## Workflow
 
+### Step 0: Establish Session Identity
+
+Before reading or writing any file under `do-work/`, establish session identity per [actions/session-identity.md](./session-identity.md). A verification that writes a `## Verification` block into a REQ file is a coordinated write and must not happen without a session record in place. If session-identity setup fails, abort — do not attempt a "silent" verify.
+
+If verify-request is running as Step 5.5 inside the do action, session identity was already established at do's Step 0 — refresh the heartbeat and proceed.
+
 ### Step 1: Find the Target UR
 
 1. **If running automatically after do action**: Use the UR that was just created

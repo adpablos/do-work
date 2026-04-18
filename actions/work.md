@@ -265,6 +265,7 @@ The work action is an **orchestrator**. You (the orchestrator) are responsible f
 
 ```
 Work order — [REQ-NNN]:
+[ ] Step 0.5: Establish session identity per actions/session-identity.md
 [ ] Step 1:   Identify next REQ-*.md in do-work/
 [ ] Step 2:   Claim → move to working/, update frontmatter (status: claimed)
 [ ] Step 3:   Triage → assign route A/B/C, append ## Triage section
@@ -277,6 +278,8 @@ Work order — [REQ-NNN]:
 [ ] Step 8:   Commit → git add -A && git commit (git repos only)
 [ ] Step 9:   Loop or exit
 ```
+
+Step 0.5 must be satisfied before any `do-work/` write. When the work action loops across multiple REQs in the same session, session identity is established once and refreshed via heartbeat — not re-established per REQ.
 
 Marking Step 4.5 as done means `## Plan Verification` is written to the request file. Marking Step 6.5 as done means `## Testing` is written to the request file. Checking a box without the artifact does not count.
 

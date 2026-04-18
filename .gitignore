@@ -2,5 +2,8 @@
 docs/prd/*.md
 !docs/prd/README.md
 
+# Session records — ephemeral runtime state per actions/session-identity.md
+do-work/.sessions/
+
 # macOS
 .DS_Store

@@ -4,6 +4,19 @@ What's new, what's better, what's different. Most recent stuff on top.
 
 ---
 
+## 0.14.0 — The Name Tag (2026-04-17)
+
+First foundational REQ of the parallel-safety work lands: every coordinated action now declares a session identity and writes a heartbeat to disk before touching `do-work/`. Nothing else about the skill changes yet — claims, locks, and orphan recovery come next, and they all consume this. Session records live in `do-work/.sessions/` and are gitignored because they are ephemeral runtime state.
+
+- New `actions/session-identity.md` — the source-of-truth protocol: session ID format, record schema, heartbeat cadence, lifecycle, debuggability guarantees
+- SKILL.md points at the new action and introduces "session protocol" as a cross-cutting concept
+- Step 0 of `do.md`, `work.md`, `verify-request.md`, `verify-plan.md`, and `cleanup.md` now requires establishing session identity before any coordinated write
+- `.gitignore` excludes `do-work/.sessions/`
+- `version` action remains exempt — read-only, no coordinated writes
+- Stale-claim TTL logic in `work.md` flagged but left alone; its replacement is REQ-005
+
+---
+
 ## 0.13.3 — The First Dogfood (2026-04-17)
 
 First real meta-capture: the parallel-safety PRD became UR-001 with ten linked REQs, each mapping the PRD's failure modes and binding architectural decisions to a discrete piece of work. The draft is gone — the UR is now the source of truth — and the queue is sequenced so session identity and shared primitives land before any of the race fixes that depend on them.
