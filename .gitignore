@@ -8,5 +8,8 @@ do-work/.sessions/
 # Lockfiles — ephemeral runtime state per actions/concurrency-primitives.md
 do-work/.locks/
 
+# Python bytecode
+__pycache__/
+
 # macOS
 .DS_Store

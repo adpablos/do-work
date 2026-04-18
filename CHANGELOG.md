@@ -4,6 +4,15 @@ What's new, what's better, what's different. Most recent stuff on top.
 
 ---
 
+## 0.15.1 — The Sweep Up (2026-04-17)
+
+Small cleanup pass after the concurrency library landed. Python bytecode artifacts are ignored now, so running the isolated test suite no longer dirties the repo or sneaks cache files into future commits.
+
+- Added `__pycache__/` to `.gitignore`
+- Removed generated `.pyc` files created by the new unittest run
+
+---
+
 ## 0.15.0 — The Lockbox (2026-04-17)
 
 Parallel-safe coordination now has a real runtime behind it. The skill ships a shared concurrency library with lockfiles, atomic writes, atomic renames, and claim-file helpers, plus isolated tests so later REQs can wire it in without inventing their own filesystem tricks.
