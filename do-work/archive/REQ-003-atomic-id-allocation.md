@@ -1,8 +1,11 @@
 ---
 id: REQ-003
 title: Atomic ID allocation for REQs and URs
-status: pending
+status: completed
 created_at: 2026-04-17T23:50:00Z
+claimed_at: 2026-04-18T16:45:28Z
+completed_at: 2026-04-18T16:45:28Z
+route: C
 user_request: UR-001
 related: [REQ-001, REQ-002, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010]
 batch: parallel-safety
@@ -72,3 +75,54 @@ See [user-requests/UR-001/input.md](./user-requests/UR-001/input.md) — "ID col
 | 4 | "Capture holds a short lock on ID allocation" (Resolved decision — Concurrency model) | Detailed Requirements — Minimal lock scope (Constraints); Lock-guarded allocation | Full |
 
 *Verified by verify-request action*
+
+## Exploration
+
+**Not needed** — the REQ already names the exact touch points: capture flow in `actions/do.md`, shared primitives in `lib/concurrency.py`, and concurrency coverage in `lib/concurrency_test.py`. No extra discovery pass was required beyond reading the existing library and the capture contract.
+
+*Skipped by work action*
+
+## Implementation Summary
+
+### Files created
+
+None.
+
+### Files modified
+
+- `lib/concurrency.py` — added namespace-specific ID allocation scopes plus `allocate_ur_input(...)` / `allocate_req_file(...)` to mint IDs under short locks, scan authoritative locations, write placeholders before release, and fail loudly on collisions.
+- `lib/concurrency_test.py` — added allocator coverage for UR/REQ scan sources, write-failure cleanup, cross-namespace lock independence, and concurrent REQ allocation producing unique IDs.
+- `actions/concurrency-primitives.md` — documented the new allocator APIs, lock scopes, scan coverage, and test expectations.
+- `actions/do.md` — replaced manual "scan highest ID" guidance with mandatory allocator calls in both simple and complex capture flows.
+
+### Implementation notes
+
+- REQ and UR allocation now use separate lock scopes: `id-allocation:req` and `id-allocation:ur`.
+- The allocator creates the actual placeholder file under the lock, not just the number, so a second capture cannot re-derive the same ID from an empty directory.
+- Contention on a just-created lockfile now tolerates the tiny window before the holder finishes writing JSON into the lockfile; contenders retry lock inspection instead of failing on a transient partial read.
+- Conflict detection is loud by design: if the computed "next" identifier already exists anywhere authoritative, the allocator raises with the conflicting path.
+
+### Deviations from plan
+
+None. The implementation stayed inside capture docs plus the shared concurrency runtime/tests.
+
+*Completed by work action (Route C)*
+
+## Testing
+
+**Command run:**
+
+```bash
+python3 -m unittest lib.concurrency_test -v
+```
+
+**Result:** Pass (23/23 tests green)
+
+**Coverage exercised by the suite:**
+
+- Existing lock primitive behavior: acquire/release/inspect, holder details on contention, heartbeat refresh, foreign-release protection, stale/orphan classification.
+- Atomic filesystem primitives: rename success/failure modes and atomic-write crash cleanup.
+- REQ-003 allocator behavior: authoritative scan coverage for REQ and UR namespaces, loud next-ID conflict detection, cleanup when UR placeholder write fails, and separate REQ/UR lock namespaces.
+- Concurrency behavior: 20 spawned processes race for one lock and exactly one wins; parallel REQ allocations still serialize into unique IDs.
+
+*Verified by work action*

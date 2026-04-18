@@ -17,7 +17,7 @@ Both are mandatory. Never create one without the other. This applies to every in
 - A UR without REQ files is pointless — nothing gets queued for the work action
 - The verify action depends on this linkage to evaluate capture quality
 
-Shared coordination helpers for lockfiles, atomic writes, atomic renames, and claim-file parsing now live in [actions/concurrency-primitives.md](./concurrency-primitives.md) and `lib/concurrency.py`. The do action stays focused on capture; later REQs wire those primitives into the coordinated steps that need them.
+Shared coordination helpers for lockfiles, atomic writes, atomic renames, claim-file parsing, and atomic REQ/UR ID allocation now live in [actions/concurrency-primitives.md](./concurrency-primitives.md) and `lib/concurrency.py`. The do action stays focused on capture; later REQs wire the rest of those primitives into the coordinated steps that need them.
 
 ## Philosophy
 
@@ -120,7 +120,12 @@ See Step 2 for the full addendum-to-in-flight workflow.
 - Naming: `REQ-[num]-[descriptive-name].png` (or appropriate extension)
 - Examples: `do-work/user-requests/UR-003/assets/REQ-017-toc-screenshot.png`
 
-To get the next REQ number, check existing `REQ-*.md` files in `do-work/`, `do-work/working/`, and `do-work/archive/` (and inside `archive/UR-*/`), then increment from the highest. UR folders use their own numbering sequence — check `do-work/user-requests/` and `do-work/archive/UR-*/` for the highest existing UR number.
+Do **not** hand-scan for the next REQ/UR number anymore. Call the shared allocator in `lib.concurrency`:
+
+- `allocate_ur_input(do_work_root, *, session_id, operation, content, now=None)` scans `do-work/user-requests/` and `do-work/archive/UR-*`, creates `do-work/user-requests/UR-NNN/input.md`, and only then releases `do-work/.locks/id-allocation-ur.lock`.
+- `allocate_req_file(do_work_root, *, session_id, operation, slug, content, now=None)` scans `do-work/`, `do-work/working/`, `do-work/archive/`, and `do-work/archive/UR-*/`, creates `do-work/REQ-NNN-slug.md`, and only then releases `do-work/.locks/id-allocation-req.lock`.
+
+This is mandatory. Manual "scan highest ID and increment" logic is obsolete and reintroduces the race REQ-003 fixes.
 
 ### Backward Compatibility
 
@@ -600,16 +605,16 @@ Screenshot of settings with a dropdown.
 
 #### Simple Mode
 
-**1. Create the User Request (UR) folder:**
-   a. Determine the next UR number (check `do-work/user-requests/` and `do-work/archive/UR-*/` for highest existing number)
-   b. Create `do-work/user-requests/UR-NNN/input.md` with the verbatim user input (minimal format — see UR input.md Format above)
-   c. Leave the `requests` array empty initially — you will fill it in step 3
+**1. Allocate the User Request (UR) placeholder:**
+   a. Call `lib.concurrency.allocate_ur_input(...)` to mint the next UR ID under the `id-allocation:ur` lock
+   b. Pass the full initial `input.md` content as `content` so the placeholder exists before the lock is released
+   c. Leave the `requests` array empty initially — you will fill it in step 3 after all REQs are allocated
 
-**2. Create REQ files** (one per distinct request):
-   a. Determine the next REQ number (check `do-work/`, `working/`, and `archive/` for highest existing number)
-   b. Create a slug from the request (lowercase, hyphens, 3-4 words max)
-   c. Generate the current ISO 8601 timestamp for `created_at`
-   d. Write the file using the **simple request format**
+**2. Allocate REQ files** (one per distinct request):
+   a. Create a slug from the request (lowercase, hyphens, 3-4 words max)
+   b. Generate the current ISO 8601 timestamp for `created_at`
+   c. Call `lib.concurrency.allocate_req_file(...)` for each REQ so the ID is minted under the `id-allocation:req` lock
+   d. Pass the full file content to the allocator — the queue file must exist before the lock is released
    e. **Set `user_request: UR-NNN`** in frontmatter — this links the REQ back to its UR
    f. Keep the original verbatim request in the Source field
 
@@ -623,10 +628,10 @@ For complex, multi-feature requests:
 
 **1. Create the User Request (UR) folder first:**
 
-1. Determine the next UR number (check `do-work/user-requests/` and `do-work/archive/UR-*/`)
-2. Create `do-work/user-requests/UR-NNN/`
-3. Create `do-work/user-requests/UR-NNN/assets/` (for screenshots/attachments)
-4. Write `do-work/user-requests/UR-NNN/input.md`:
+1. Call `lib.concurrency.allocate_ur_input(...)` to mint the UR ID and create `do-work/user-requests/UR-NNN/input.md`
+2. Create `do-work/user-requests/UR-NNN/assets/` (for screenshots/attachments) after the allocator returns
+3. If you need to expand the just-created `input.md`, rewrite that file in place after allocation; the ID is already reserved
+4. The initial `input.md` content passed to the allocator should contain:
 
 ```yaml
 ---
@@ -652,8 +657,8 @@ word_count: [count words in original input]
 **3. Create individual request files:**
 
 For EACH identified feature:
-1. Determine the next REQ number
-2. Create using the **complex request format**
+1. Create using the **complex request format**
+2. Call `lib.concurrency.allocate_req_file(...)` to mint the REQ ID and write the placeholder queue file atomically
 3. Set `user_request` to the UR identifier (e.g., `UR-001`)
 4. Set `related` to other REQ IDs in this batch
 5. Set `batch` to a short name for this group

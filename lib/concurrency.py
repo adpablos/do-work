@@ -11,17 +11,21 @@ from __future__ import annotations
 import errno
 import json
 import os
+import re
 import secrets
 import socket
 import tempfile
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal, Optional, Union
+from pathlib import Path
+from typing import Any, Iterable, Literal, Optional, Union
 
 PathLike = Union[str, os.PathLike]
 
 CANONICAL_SCOPES: frozenset[str] = frozenset({
-    "id-allocation",
+    "id-allocation:req",
+    "id-allocation:ur",
     "cleanup-global",
 })
 
@@ -103,6 +107,27 @@ class ForeignReleaseError(ConcurrencyError):
     the on-disk lockfile (the lock was replaced by a different session)."""
 
 
+@dataclass(frozen=True)
+class AllocatedId:
+    identifier: str
+    number: int
+    namespace: Literal["req", "ur"]
+    path: str
+    lock_path: str
+
+
+REQ_ID_RE = re.compile(r"^REQ-(\d+)(?:-.+)?\.md$")
+UR_ID_RE = re.compile(r"^UR-(\d+)$")
+ID_NAMESPACE_PREFIX: dict[Literal["req", "ur"], str] = {
+    "req": "REQ",
+    "ur": "UR",
+}
+ID_NAMESPACE_SCOPE: dict[Literal["req", "ur"], str] = {
+    "req": "id-allocation:req",
+    "ur": "id-allocation:ur",
+}
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -117,6 +142,136 @@ def _parse_iso(s: str) -> datetime:
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
     return datetime.fromisoformat(s).astimezone(timezone.utc)
+
+
+def _coerce_do_work_root(path: PathLike) -> Path:
+    return Path(os.fspath(path))
+
+
+def _id_lock_path(do_work_root: PathLike, namespace: Literal["req", "ur"]) -> Path:
+    root = _coerce_do_work_root(do_work_root)
+    return root / ".locks" / f"id-allocation-{namespace}.lock"
+
+
+def _format_identifier(namespace: Literal["req", "ur"], number: int) -> str:
+    return f"{ID_NAMESPACE_PREFIX[namespace]}-{number:03d}"
+
+
+def _extract_identifier_number(path: Path, namespace: Literal["req", "ur"]) -> Optional[int]:
+    matcher = REQ_ID_RE if namespace == "req" else UR_ID_RE
+    match = matcher.match(path.name)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _iter_authoritative_req_paths(do_work_root: PathLike) -> Iterable[Path]:
+    root = _coerce_do_work_root(do_work_root)
+    patterns = (
+        "REQ-*.md",
+        "working/REQ-*.md",
+        "archive/REQ-*.md",
+        "archive/UR-*/REQ-*.md",
+    )
+    for pattern in patterns:
+        yield from root.glob(pattern)
+
+
+def _iter_authoritative_ur_paths(do_work_root: PathLike) -> Iterable[Path]:
+    root = _coerce_do_work_root(do_work_root)
+    patterns = (
+        "user-requests/UR-*",
+        "archive/UR-*",
+    )
+    for pattern in patterns:
+        yield from root.glob(pattern)
+
+
+def _iter_authoritative_paths(
+    do_work_root: PathLike,
+    namespace: Literal["req", "ur"],
+) -> Iterable[Path]:
+    if namespace == "req":
+        yield from _iter_authoritative_req_paths(do_work_root)
+        return
+    yield from _iter_authoritative_ur_paths(do_work_root)
+
+
+def _scan_existing_numbers(
+    do_work_root: PathLike,
+    namespace: Literal["req", "ur"],
+) -> list[int]:
+    numbers = []
+    for path in _iter_authoritative_paths(do_work_root, namespace):
+        number = _extract_identifier_number(path, namespace)
+        if number is not None:
+            numbers.append(number)
+    return numbers
+
+
+def _next_identifier_number(
+    do_work_root: PathLike,
+    namespace: Literal["req", "ur"],
+) -> int:
+    numbers = _scan_existing_numbers(do_work_root, namespace)
+    return max(numbers, default=0) + 1
+
+
+def _find_conflicting_identifier_path(
+    do_work_root: PathLike,
+    namespace: Literal["req", "ur"],
+    identifier: str,
+) -> Optional[Path]:
+    number = int(identifier.split("-", 1)[1])
+    for path in _iter_authoritative_paths(do_work_root, namespace):
+        existing = _extract_identifier_number(path, namespace)
+        if existing == number:
+            return path
+    return None
+
+
+def _write_new_file(path: PathLike, content: str, *, transition: str) -> None:
+    target = Path(os.fspath(path))
+    temp_target = target.with_name(f"{target.name}.allocating.{secrets.token_hex(4)}")
+    try:
+        atomic_write(temp_target, content)
+        atomic_rename(temp_target, target, transition=transition)
+    except Exception:
+        try:
+            os.unlink(temp_target)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        raise
+
+
+def _acquire_id_allocation_lock(
+    do_work_root: PathLike,
+    *,
+    namespace: Literal["req", "ur"],
+    session_id: str,
+    operation: str,
+    now: Optional[datetime] = None,
+    timeout_seconds: float = 5.0,
+    retry_interval_seconds: float = 0.05,
+) -> LockHandle:
+    lock_path = _id_lock_path(do_work_root, namespace)
+    deadline = time.monotonic() + timeout_seconds
+
+    while True:
+        try:
+            return acquire_lock(
+                lock_path,
+                session_id=session_id,
+                operation=operation,
+                scope=ID_NAMESPACE_SCOPE[namespace],
+                now=now,
+            )
+        except LockHeldError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(retry_interval_seconds)
 
 
 def validate_scope(scope: str) -> None:
@@ -287,6 +442,24 @@ def _write_lockfile_exclusive(path: str, info: LockInfo) -> None:
         raise
 
 
+def _inspect_lock_after_contention(
+    path: str,
+    *,
+    attempts: int = 5,
+    retry_interval_seconds: float = 0.01,
+) -> Optional[LockInfo]:
+    last_error: Optional[ClaimFormatError] = None
+    for _ in range(attempts):
+        try:
+            return inspect_lock(path)
+        except ClaimFormatError as exc:
+            last_error = exc
+            time.sleep(retry_interval_seconds)
+    if last_error is not None:
+        raise last_error
+    return None
+
+
 def acquire_lock(
     path: PathLike,
     *,
@@ -315,7 +488,7 @@ def acquire_lock(
     try:
         _write_lockfile_exclusive(target, info)
     except FileExistsError:
-        holder = inspect_lock(target)
+        holder = _inspect_lock_after_contention(target)
         if holder is None:
             # Rare race: file existed at O_EXCL but was released before we read.
             # Retry once.
@@ -323,7 +496,7 @@ def acquire_lock(
                 _write_lockfile_exclusive(target, info)
                 return LockHandle(path=target, info=info)
             except FileExistsError:
-                holder = inspect_lock(target)
+                holder = _inspect_lock_after_contention(target)
         if holder is None:
             raise LockHeldError(
                 path=target,
@@ -480,6 +653,112 @@ def write_claim(path: PathLike, claim: ClaimRecord) -> None:
     atomic_write(path, json.dumps(claim.to_dict(), indent=2, sort_keys=True) + "\n")
 
 
+def allocate_ur_input(
+    do_work_root: PathLike,
+    *,
+    session_id: str,
+    operation: str,
+    content: str,
+    now: Optional[datetime] = None,
+) -> AllocatedId:
+    root = _coerce_do_work_root(do_work_root)
+    lock_path = _id_lock_path(root, "ur")
+    handle = _acquire_id_allocation_lock(
+        root,
+        namespace="ur",
+        session_id=session_id,
+        operation=operation,
+        now=now,
+    )
+    try:
+        number = _next_identifier_number(root, "ur")
+        identifier = _format_identifier("ur", number)
+        conflict = _find_conflicting_identifier_path(root, "ur", identifier)
+        if conflict is not None:
+            raise CollisionError(
+                f"allocate_ur_input: next id {identifier} already exists at "
+                f"{os.fspath(conflict)!r}"
+            )
+
+        ur_dir = root / "user-requests" / identifier
+        input_path = ur_dir / "input.md"
+        try:
+            os.makedirs(ur_dir, exist_ok=False)
+        except FileExistsError as exc:
+            raise CollisionError(
+                f"allocate_ur_input: destination directory {os.fspath(ur_dir)!r} "
+                "already exists"
+            ) from exc
+
+        try:
+            _write_new_file(
+                input_path,
+                content,
+                transition=f"allocate input for {identifier}",
+            )
+        except Exception:
+            try:
+                os.rmdir(ur_dir)
+            except OSError:
+                pass
+            raise
+
+        return AllocatedId(
+            identifier=identifier,
+            number=number,
+            namespace="ur",
+            path=os.fspath(input_path),
+            lock_path=os.fspath(lock_path),
+        )
+    finally:
+        release_lock(handle)
+
+
+def allocate_req_file(
+    do_work_root: PathLike,
+    *,
+    session_id: str,
+    operation: str,
+    slug: str,
+    content: str,
+    now: Optional[datetime] = None,
+) -> AllocatedId:
+    root = _coerce_do_work_root(do_work_root)
+    lock_path = _id_lock_path(root, "req")
+    handle = _acquire_id_allocation_lock(
+        root,
+        namespace="req",
+        session_id=session_id,
+        operation=operation,
+        now=now,
+    )
+    try:
+        number = _next_identifier_number(root, "req")
+        identifier = _format_identifier("req", number)
+        conflict = _find_conflicting_identifier_path(root, "req", identifier)
+        if conflict is not None:
+            raise CollisionError(
+                f"allocate_req_file: next id {identifier} already exists at "
+                f"{os.fspath(conflict)!r}"
+            )
+
+        target = root / f"{identifier}-{slug}.md"
+        _write_new_file(
+            target,
+            content,
+            transition=f"allocate queue file for {identifier}",
+        )
+        return AllocatedId(
+            identifier=identifier,
+            number=number,
+            namespace="req",
+            path=os.fspath(target),
+            lock_path=os.fspath(lock_path),
+        )
+    finally:
+        release_lock(handle)
+
+
 __all__ = [
     "CANONICAL_SCOPES",
     "PARAMETERIZED_SCOPE_PREFIXES",
@@ -493,6 +772,7 @@ __all__ = [
     "CollisionError",
     "AtomicWriteError",
     "ForeignReleaseError",
+    "AllocatedId",
     "LockInfo",
     "LockHandle",
     "ClaimRecord",
@@ -506,4 +786,6 @@ __all__ = [
     "atomic_write",
     "read_claim",
     "write_claim",
+    "allocate_ur_input",
+    "allocate_req_file",
 ]

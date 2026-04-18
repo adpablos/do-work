@@ -4,6 +4,17 @@ What's new, what's better, what's different. Most recent stuff on top.
 
 ---
 
+## 0.15.2 — The Turnstile (2026-04-18)
+
+Parallel capture stops guessing IDs now. REQ and UR allocation both go through short namespace locks, so concurrent sessions mint unique placeholders on disk before they let go.
+
+- Added atomic REQ/UR allocators to `lib/concurrency.py` with separate `id-allocation:req` and `id-allocation:ur` scopes
+- Added allocator coverage in `lib/concurrency_test.py` for scan sources, cleanup on failed writes, lock independence, and concurrent unique-ID allocation
+- Updated `actions/do.md` and `actions/concurrency-primitives.md` so capture uses the shared allocator instead of hand-scanning for the next number
+- Archived `REQ-003` as completed
+
+---
+
 ## 0.15.1 — The Sweep Up (2026-04-17)
 
 Small cleanup pass after the concurrency library landed. Python bytecode artifacts are ignored now, so running the isolated test suite no longer dirties the repo or sneaks cache files into future commits.

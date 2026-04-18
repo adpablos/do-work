@@ -3,6 +3,7 @@ import json
 import multiprocessing
 import os
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,6 +22,8 @@ from lib.concurrency import (
     ScopeError,
     StaleRenameError,
     acquire_lock,
+    allocate_req_file,
+    allocate_ur_input,
     atomic_rename,
     atomic_write,
     classify_lock,
@@ -253,6 +256,155 @@ class ConcurrencyPrimitivesTest(unittest.TestCase):
         self.assertFalse(target.exists())
         leftovers = list(self.root.glob("request.json.*.tmp.*"))
         self.assertEqual(leftovers, [])
+
+    def test_allocate_ur_input_scans_active_and_archived_ur_locations(self) -> None:
+        (self.root / "user-requests" / "UR-003").mkdir(parents=True, exist_ok=True)
+        (self.root / "archive" / "UR-009").mkdir(parents=True, exist_ok=True)
+
+        allocation = allocate_ur_input(
+            self.root,
+            session_id="session-1",
+            operation="do",
+            content="ur placeholder\n",
+        )
+
+        self.assertEqual(allocation.identifier, "UR-010")
+        self.assertEqual(Path(allocation.path), self.root / "user-requests" / "UR-010" / "input.md")
+        self.assertEqual(
+            Path(allocation.path).read_text(encoding="utf-8"),
+            "ur placeholder\n",
+        )
+        self.assertFalse(Path(allocation.lock_path).exists())
+
+    def test_allocate_req_file_scans_queue_working_archive_and_archived_ur_locations(self) -> None:
+        (self.root / "REQ-002-queued.md").write_text("queued\n", encoding="utf-8")
+        (self.root / "working").mkdir(parents=True, exist_ok=True)
+        (self.root / "working" / "REQ-007-working.md").write_text("working\n", encoding="utf-8")
+        (self.root / "archive").mkdir(parents=True, exist_ok=True)
+        (self.root / "archive" / "REQ-009-archived.md").write_text("archive\n", encoding="utf-8")
+        (self.root / "archive" / "UR-011").mkdir(parents=True, exist_ok=True)
+        (self.root / "archive" / "UR-011" / "REQ-012-inside-ur.md").write_text(
+            "nested\n",
+            encoding="utf-8",
+        )
+
+        allocation = allocate_req_file(
+            self.root,
+            session_id="session-1",
+            operation="do",
+            slug="new-request",
+            content="req placeholder\n",
+        )
+
+        self.assertEqual(allocation.identifier, "REQ-013")
+        self.assertEqual(
+            Path(allocation.path),
+            self.root / "REQ-013-new-request.md",
+        )
+        self.assertEqual(
+            Path(allocation.path).read_text(encoding="utf-8"),
+            "req placeholder\n",
+        )
+        self.assertFalse(Path(allocation.lock_path).exists())
+
+    def test_allocate_ur_input_cleans_up_directory_on_write_failure(self) -> None:
+        with mock.patch(
+            "lib.concurrency.atomic_write",
+            side_effect=AtomicWriteError("disk full"),
+        ):
+            with self.assertRaises(AtomicWriteError):
+                allocate_ur_input(
+                    self.root,
+                    session_id="session-1",
+                    operation="do",
+                    content="ur placeholder\n",
+                )
+
+        self.assertFalse((self.root / "user-requests" / "UR-001").exists())
+
+    def test_allocate_req_file_fails_loud_on_conflicting_next_id_path(self) -> None:
+        conflict = self.root / "archive" / "REQ-004-existing.md"
+        conflict.parent.mkdir(parents=True, exist_ok=True)
+        conflict.write_text("existing\n", encoding="utf-8")
+
+        with mock.patch("lib.concurrency._next_identifier_number", return_value=4):
+            with self.assertRaises(CollisionError) as ctx:
+                allocate_req_file(
+                    self.root,
+                    session_id="session-1",
+                    operation="do",
+                    slug="new-request",
+                    content="req placeholder\n",
+                )
+
+        self.assertIn("REQ-004", str(ctx.exception))
+        self.assertIn(str(conflict), str(ctx.exception))
+
+    def test_allocate_ur_input_uses_a_different_lock_namespace_than_req_allocation(self) -> None:
+        req_lock = acquire_lock(
+            self.root / ".locks" / "id-allocation-req.lock",
+            session_id="session-1",
+            operation="do",
+            scope="id-allocation:req",
+        )
+        self.addCleanup(release_lock, req_lock)
+
+        allocation = allocate_ur_input(
+            self.root,
+            session_id="session-2",
+            operation="do",
+            content="ur placeholder\n",
+        )
+
+        self.assertEqual(allocation.identifier, "UR-001")
+        self.assertTrue((self.root / ".locks" / "id-allocation-req.lock").exists())
+
+    def test_parallel_req_allocations_produce_unique_ids(self) -> None:
+        worker_count = 4
+        barrier = threading.Barrier(worker_count)
+        results: list[tuple[str, str, str]] = []
+        errors: list[BaseException] = []
+        result_lock = threading.Lock()
+
+        def worker(index: int) -> None:
+            try:
+                barrier.wait(timeout=5)
+                allocation = allocate_req_file(
+                    self.root,
+                    session_id=f"session-{index}",
+                    operation="do",
+                    slug="parallel-capture",
+                    content="placeholder\n",
+                )
+                with result_lock:
+                    results.append(("ok", allocation.identifier, allocation.path))
+            except BaseException as exc:  # pragma: no cover - asserted below
+                with result_lock:
+                    errors.append(exc)
+
+        threads = [
+            threading.Thread(target=worker, args=(index,), daemon=True)
+            for index in range(worker_count)
+        ]
+
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+
+        self.assertEqual(errors, [])
+
+        successes = [result for result in results if result[0] == "ok"]
+        self.assertEqual(len(successes), worker_count)
+        identifiers = {result[1] for result in successes}
+        self.assertEqual(len(identifiers), worker_count)
+        self.assertEqual(
+            sorted(identifiers),
+            [f"REQ-{n:03d}" for n in range(1, worker_count + 1)],
+        )
+        for _, _, path in successes:
+            self.assertTrue(Path(path).exists())
 
     def test_claim_round_trip(self) -> None:
         claim = ClaimRecord(

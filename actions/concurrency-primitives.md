@@ -4,7 +4,7 @@
 
 ## What This Provides
 
-A filesystem-only toolbox that lets sessions coordinate without races: exclusive lockfiles, atomic renames, atomic writes, a claim file format, and a catalog of canonical lock scopes. All primitives are stdlib-only Python 3 and consult the session-identity record (REQ-001) so every lock knows which session holds it.
+A filesystem-only toolbox that lets sessions coordinate without races: exclusive lockfiles, atomic renames, atomic writes, atomic REQ/UR ID allocation for capture, a claim file format, and a catalog of canonical lock scopes. All primitives are stdlib-only Python 3 and consult the session-identity record (REQ-001) so every lock knows which session holds it.
 
 This is a **library of primitives**, not a policy. Individual actions decide when and at what scope to use each primitive (see REQ-003..REQ-010). The library does not assume. The rule: **never hand-roll a lock, a claim, or a state transition — call the library.**
 
@@ -94,7 +94,34 @@ Cross-host cases (`info.hostname != local hostname`) always return `stale` — U
 
 - `atomic_write(path, content, *, mode="w")` — writes to `<path>.tmp.<hex>`, `fsync`s, then `os.rename` onto `path`. The temp name is unique per call so two concurrent writers don't collide on the temp file itself (they may still race on the final rename — last-writer-wins, which is the documented POSIX semantics and is the caller's responsibility to serialize when needed).
 
-### 5. Claim File Format
+### 5. Atomic ID Allocation
+
+**Contract:** Capture never hand-scans for `REQ-NNN` / `UR-NNN`. It calls the allocator, which acquires the namespace-specific ID lock, scans every authoritative location for that namespace, writes the placeholder on disk, and only then releases the lock.
+
+**API:**
+
+- `allocate_ur_input(do_work_root, *, session_id, operation, content, now=None) -> AllocatedId`
+- `allocate_req_file(do_work_root, *, session_id, operation, slug, content, now=None) -> AllocatedId`
+
+**Namespace behavior:**
+
+- REQs use `id-allocation:req` and lock path `do-work/.locks/id-allocation-req.lock`
+- URs use `id-allocation:ur` and lock path `do-work/.locks/id-allocation-ur.lock`
+- The allocator retries briefly on lock contention because parallel capture is expected; the underlying `acquire_lock(...)` primitive remains fail-fast.
+
+**Authoritative scan coverage:**
+
+- `allocate_req_file(...)` scans `do-work/REQ-*.md`, `do-work/working/REQ-*.md`, `do-work/archive/REQ-*.md`, and `do-work/archive/UR-*/REQ-*.md`
+- `allocate_ur_input(...)` scans `do-work/user-requests/UR-*` and `do-work/archive/UR-*`
+
+**Write-then-release guarantee:**
+
+- UR allocation is not complete until `do-work/user-requests/UR-NNN/input.md` exists on disk.
+- REQ allocation is not complete until `do-work/REQ-NNN-slug.md` exists on disk.
+- If the placeholder write fails, the allocator releases the lock and removes any directory it created.
+- If the "next" ID already exists anywhere authoritative, allocation fails loudly with the conflicting path.
+
+### 6. Claim File Format
 
 **Contract:** One JSON schema for every claim file produced by REQ-004 (work claim), REQ-007 (verify claim), REQ-009 (cleanup claim). One parser, one writer.
 
@@ -119,13 +146,14 @@ Cross-host cases (`info.hostname != local hostname`) always return `stale` — U
 
 Claim lifecycle (when to create, refresh, release) is **not** defined here — that is per-action policy (REQ-004/REQ-007/REQ-009).
 
-### 6. Standard Lock Scopes
+### 7. Standard Lock Scopes
 
 **Canonical catalog.** Scope names are canonical and typed. Ad-hoc scope strings are rejected by `acquire_lock` via `ScopeError`. New scopes must be added to this document **and** to `SCOPES` in `lib/concurrency.py` before they can be used in action code.
 
 | Scope name             | Used by     | Purpose                                                           |
 |------------------------|-------------|-------------------------------------------------------------------|
-| `id-allocation`        | REQ-003     | Global lock for atomic REQ/UR ID allocation during capture.       |
+| `id-allocation:req`    | REQ-003     | Short lock for atomic REQ ID allocation during capture.           |
+| `id-allocation:ur`     | REQ-003     | Short lock for atomic UR ID allocation during capture.            |
 | `req-claim:<REQ-id>`   | REQ-004     | Per-REQ lock when claiming a queue entry.                         |
 | `ur-archival:<UR-id>`  | REQ-006     | Per-UR lock during final-REQ-done archival.                       |
 | `verify-doc:<path>`    | REQ-007     | Per-document lock during verify-request/verify-plan.              |
@@ -134,7 +162,7 @@ Claim lifecycle (when to create, refresh, release) is **not** defined here — t
 
 Parameterized scopes (those with `:<...>`) accept any suffix; the library validates the scope **prefix** against the canonical list.
 
-### 7. Deterministic Failure Messages
+### 8. Deterministic Failure Messages
 
 Every lock-acquisition failure carries:
 
@@ -184,7 +212,7 @@ Out of scope for REQ-002 — each item is owned by a later REQ in the batch:
 
 - **Claim lifecycle** (when to create/refresh/release claims) — REQ-004, REQ-007, REQ-009.
 - **Orphan recovery decision** — REQ-005. This library emits the verdict; it does not act on it.
-- **ID allocation** — REQ-003 consumes `id-allocation` scope.
+- **Capture rollback beyond placeholder allocation** — REQ-008 owns the multi-file transaction / cleanup policy after IDs are minted.
 - **UR archival atomicity** — REQ-006 consumes `ur-archival:<UR-id>` scope.
 - **Foreign-edit detection logic** — REQ-010 consumes `foreign-edit:<path>` scope.
 - **Action wiring.** REQ-002 ships the primitives. Callers are introduced in REQ-003..REQ-010.
@@ -195,7 +223,8 @@ Out of scope for REQ-002 — each item is owned by a later REQ in the batch:
 All primitives are exercised by `lib/concurrency_test.py` against a `tempfile.TemporaryDirectory`. Tests include:
 
 - Unit coverage: acquire/release/inspect, classify verdicts, atomic rename failure modes, atomic write visibility, claim round-trip, scope validation.
-- Concurrency coverage: 20 `multiprocessing` workers race on one lock; exactly one wins.
+- Allocation coverage: authoritative-path scans for REQ and UR IDs, loud collision detection, cleanup on placeholder-write failure, and separate REQ/UR lock namespaces.
+- Concurrency coverage: 20 `multiprocessing` workers race on one lock; exactly one wins, and 4 parallel REQ allocations serialize into 4 unique IDs.
 
 Run from the repo root:
 
