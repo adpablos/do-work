@@ -1,0 +1,509 @@
+"""Shared concurrency primitives for the do-work skill.
+
+See actions/concurrency-primitives.md for the full contract. This module ships
+the executable primitives; every other REQ in the parallel-safety batch
+(REQ-003..REQ-010) consumes them.
+
+Stdlib only. Python 3.9+.
+"""
+from __future__ import annotations
+
+import errno
+import json
+import os
+import secrets
+import socket
+import tempfile
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Literal, Optional, Union
+
+PathLike = Union[str, os.PathLike]
+
+CANONICAL_SCOPES: frozenset[str] = frozenset({
+    "id-allocation",
+    "cleanup-global",
+})
+
+PARAMETERIZED_SCOPE_PREFIXES: frozenset[str] = frozenset({
+    "req-claim",
+    "ur-archival",
+    "verify-doc",
+    "foreign-edit",
+})
+
+SCOPES: frozenset[str] = CANONICAL_SCOPES | frozenset(
+    f"{p}:*" for p in PARAMETERIZED_SCOPE_PREFIXES
+)
+
+
+class ConcurrencyError(Exception):
+    """Base class for all errors raised by this module."""
+
+
+class LockHeldError(ConcurrencyError):
+    """Raised when acquire_lock finds a lockfile already present.
+
+    Carries enough holder info for a caller to render a useful message.
+    """
+
+    def __init__(
+        self,
+        *,
+        path: PathLike,
+        scope: str,
+        holder: "LockInfo",
+        attempting_session_id: str,
+        attempting_operation: str,
+    ) -> None:
+        self.path = os.fspath(path)
+        self.scope = scope
+        self.holder = holder
+        self.attempting_session_id = attempting_session_id
+        self.attempting_operation = attempting_operation
+        msg = (
+            f"lock {self.path!r} is held\n"
+            f"  scope:          {scope}\n"
+            f"  held_by:        session {holder.session_id} "
+            f"(operation: {holder.operation})\n"
+            f"  acquired_at:    {holder.acquired_at}\n"
+            f"  last_heartbeat: {holder.last_heartbeat}\n"
+            f"  attempting:     session {attempting_session_id} "
+            f"(operation: {attempting_operation})"
+        )
+        super().__init__(msg)
+
+
+class ClaimFormatError(ConcurrencyError):
+    """Raised when a claim file fails to parse or is missing required fields."""
+
+
+class ScopeError(ConcurrencyError):
+    """Raised when a scope name is not in the canonical catalog."""
+
+
+class StaleRenameError(ConcurrencyError):
+    """Raised when atomic_rename's source does not exist (ENOENT)."""
+
+
+class CrossDeviceError(ConcurrencyError):
+    """Raised when atomic_rename crosses filesystems (EXDEV)."""
+
+
+class CollisionError(ConcurrencyError):
+    """Raised when atomic_rename's destination already exists."""
+
+
+class AtomicWriteError(ConcurrencyError):
+    """Raised when atomic_write fails (disk full, permissions, etc.)."""
+
+
+class ForeignReleaseError(ConcurrencyError):
+    """Raised when release_lock is called with a handle that no longer matches
+    the on-disk lockfile (the lock was replaced by a different session)."""
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_iso(s: str) -> datetime:
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s).astimezone(timezone.utc)
+
+
+def validate_scope(scope: str) -> None:
+    """Raise ScopeError if scope is not canonical."""
+    if scope in CANONICAL_SCOPES:
+        return
+    if ":" in scope:
+        prefix, _, suffix = scope.partition(":")
+        if prefix in PARAMETERIZED_SCOPE_PREFIXES and suffix:
+            return
+    raise ScopeError(
+        f"unknown scope {scope!r}. "
+        f"Canonical scopes: {sorted(CANONICAL_SCOPES)}. "
+        f"Parameterized prefixes: {sorted(PARAMETERIZED_SCOPE_PREFIXES)} "
+        f"(format: '<prefix>:<identifier>'). "
+        f"Add new scopes to actions/concurrency-primitives.md and lib/concurrency.py."
+    )
+
+
+@dataclass(frozen=True)
+class LockInfo:
+    session_id: str
+    operation: str
+    scope: str
+    acquired_at: str
+    last_heartbeat: str
+    pid: int
+    hostname: str
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "LockInfo":
+        required = {
+            "session_id", "operation", "scope",
+            "acquired_at", "last_heartbeat", "pid", "hostname",
+        }
+        missing = required - set(d)
+        if missing:
+            raise ClaimFormatError(
+                f"lockfile missing fields: {sorted(missing)}"
+            )
+        validate_scope(d["scope"])
+        return cls(**{k: d[k] for k in required})
+
+
+@dataclass
+class LockHandle:
+    path: str
+    info: LockInfo
+
+
+@dataclass(frozen=True)
+class ClaimRecord:
+    claim_id: str
+    session_id: str
+    operation: str
+    scope: str
+    affected_paths: tuple[str, ...]
+    acquired_at: str
+    last_heartbeat: str
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ClaimRecord":
+        required = {
+            "claim_id", "session_id", "operation", "scope",
+            "affected_paths", "acquired_at", "last_heartbeat",
+        }
+        missing = required - set(d)
+        if missing:
+            raise ClaimFormatError(
+                f"claim missing fields: {sorted(missing)}"
+            )
+        validate_scope(d["scope"])
+        return cls(
+            claim_id=d["claim_id"],
+            session_id=d["session_id"],
+            operation=d["operation"],
+            scope=d["scope"],
+            affected_paths=tuple(d["affected_paths"]),
+            acquired_at=d["acquired_at"],
+            last_heartbeat=d["last_heartbeat"],
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["affected_paths"] = list(self.affected_paths)
+        return d
+
+
+def atomic_write(path: PathLike, content: str, *, mode: str = "w") -> None:
+    """Write content to path via write-to-temp-then-rename.
+
+    Readers on path never see a half-written file: either the previous content
+    or the new content, never a partial blend.
+    """
+    target = os.fspath(path)
+    directory = os.path.dirname(target) or "."
+    os.makedirs(directory, exist_ok=True)
+    suffix = f".tmp.{secrets.token_hex(4)}"
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(target) + ".", suffix=suffix, dir=directory)
+    try:
+        with os.fdopen(fd, mode) as f:
+            f.write(content)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.rename(tmp, target)
+    except OSError as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise AtomicWriteError(f"atomic_write to {target!r} failed: {e}") from e
+
+
+def atomic_rename(src: PathLike, dst: PathLike, *, transition: str) -> None:
+    """Atomic state transition. Raises rich errors instead of POSIX rename's
+    silent overwrite / cryptic errnos.
+    """
+    src_s = os.fspath(src)
+    dst_s = os.fspath(dst)
+    if not os.path.exists(src_s):
+        raise StaleRenameError(
+            f"atomic_rename[{transition}]: source {src_s!r} does not exist"
+        )
+    if os.path.exists(dst_s):
+        raise CollisionError(
+            f"atomic_rename[{transition}]: destination {dst_s!r} already exists. "
+            "Atomic rename refuses silent overwrite."
+        )
+    try:
+        os.rename(src_s, dst_s)
+    except OSError as e:
+        if e.errno == errno.EXDEV:
+            raise CrossDeviceError(
+                f"atomic_rename[{transition}]: {src_s!r} and {dst_s!r} "
+                "are on different filesystems — cannot rename atomically."
+            ) from e
+        if e.errno == errno.ENOENT:
+            raise StaleRenameError(
+                f"atomic_rename[{transition}]: source {src_s!r} vanished mid-op"
+            ) from e
+        raise
+
+
+def _write_lockfile_exclusive(path: str, info: LockInfo) -> None:
+    """Create path with O_CREAT|O_EXCL and write info as JSON. Raises
+    FileExistsError if the lockfile already exists.
+    """
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(asdict(info), f, indent=2, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+
+
+def acquire_lock(
+    path: PathLike,
+    *,
+    session_id: str,
+    operation: str,
+    scope: str,
+    pid: Optional[int] = None,
+    hostname: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> LockHandle:
+    """Acquire exclusive lock at path. Fails fast with LockHeldError if held."""
+    validate_scope(scope)
+    target = os.fspath(path)
+    pid = pid if pid is not None else os.getpid()
+    hostname = hostname if hostname is not None else socket.gethostname()
+    now_s = _iso(now or _utcnow())
+    info = LockInfo(
+        session_id=session_id,
+        operation=operation,
+        scope=scope,
+        acquired_at=now_s,
+        last_heartbeat=now_s,
+        pid=pid,
+        hostname=hostname,
+    )
+    try:
+        _write_lockfile_exclusive(target, info)
+    except FileExistsError:
+        holder = inspect_lock(target)
+        if holder is None:
+            # Rare race: file existed at O_EXCL but was released before we read.
+            # Retry once.
+            try:
+                _write_lockfile_exclusive(target, info)
+                return LockHandle(path=target, info=info)
+            except FileExistsError:
+                holder = inspect_lock(target)
+        if holder is None:
+            raise LockHeldError(
+                path=target,
+                scope=scope,
+                holder=LockInfo(
+                    session_id="<unknown>",
+                    operation="<unknown>",
+                    scope=scope,
+                    acquired_at="<unknown>",
+                    last_heartbeat="<unknown>",
+                    pid=0,
+                    hostname="<unknown>",
+                ),
+                attempting_session_id=session_id,
+                attempting_operation=operation,
+            )
+        raise LockHeldError(
+            path=target,
+            scope=scope,
+            holder=holder,
+            attempting_session_id=session_id,
+            attempting_operation=operation,
+        )
+    return LockHandle(path=target, info=info)
+
+
+def inspect_lock(path: PathLike) -> Optional[LockInfo]:
+    """Return LockInfo for the lockfile at path, or None if no lockfile."""
+    target = os.fspath(path)
+    try:
+        with open(target, "r") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError as e:
+        raise ClaimFormatError(f"lockfile {target!r} is not valid JSON: {e}") from e
+    return LockInfo.from_dict(data)
+
+
+def release_lock(handle_or_path: Union[LockHandle, PathLike]) -> None:
+    """Remove the lockfile. Raises ForeignReleaseError if the on-disk content
+    no longer matches the handle's session_id.
+    """
+    if isinstance(handle_or_path, LockHandle):
+        path = handle_or_path.path
+        expected_session = handle_or_path.info.session_id
+    else:
+        path = os.fspath(handle_or_path)
+        expected_session = None
+
+    current = inspect_lock(path)
+    if current is None:
+        return  # idempotent: already released
+    if expected_session is not None and current.session_id != expected_session:
+        raise ForeignReleaseError(
+            f"refusing to release {path!r}: held by session "
+            f"{current.session_id!r}, handle claims {expected_session!r}"
+        )
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def refresh_heartbeat(
+    handle_or_path: Union[LockHandle, PathLike],
+    *,
+    now: Optional[datetime] = None,
+) -> None:
+    """Rewrite last_heartbeat on the lockfile via atomic write."""
+    if isinstance(handle_or_path, LockHandle):
+        path = handle_or_path.path
+        expected_session = handle_or_path.info.session_id
+    else:
+        path = os.fspath(handle_or_path)
+        expected_session = None
+
+    current = inspect_lock(path)
+    if current is None:
+        raise ConcurrencyError(
+            f"refresh_heartbeat: no lockfile at {path!r}"
+        )
+    if expected_session is not None and current.session_id != expected_session:
+        raise ForeignReleaseError(
+            f"refusing to refresh heartbeat on {path!r}: held by session "
+            f"{current.session_id!r}, handle claims {expected_session!r}"
+        )
+    updated = LockInfo(
+        session_id=current.session_id,
+        operation=current.operation,
+        scope=current.scope,
+        acquired_at=current.acquired_at,
+        last_heartbeat=_iso(now or _utcnow()),
+        pid=current.pid,
+        hostname=current.hostname,
+    )
+    atomic_write(path, json.dumps(asdict(updated), indent=2, sort_keys=True) + "\n")
+    if isinstance(handle_or_path, LockHandle):
+        handle_or_path.info = updated
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but we cannot signal it — treat as alive.
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def classify_lock(
+    info: LockInfo,
+    *,
+    now: datetime,
+    stale_threshold: timedelta = timedelta(minutes=2),
+) -> Literal["live", "stale", "orphaned"]:
+    """Classify an existing lock. Pure — no filesystem mutation, no I/O beyond
+    a liveness probe of the holder's PID.
+
+    Cross-host always returns 'stale' (UR-001 is single-machine).
+    """
+    local_host = socket.gethostname()
+    last_hb = _parse_iso(info.last_heartbeat)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    age = now - last_hb
+
+    if age < stale_threshold:
+        return "live"
+
+    if info.hostname != local_host:
+        return "stale"
+
+    return "orphaned" if not _pid_alive(info.pid) else "stale"
+
+
+def read_claim(path: PathLike) -> ClaimRecord:
+    target = os.fspath(path)
+    try:
+        with open(target, "r") as f:
+            data = json.load(f)
+    except FileNotFoundError as e:
+        raise ClaimFormatError(f"claim file {target!r} not found") from e
+    except json.JSONDecodeError as e:
+        raise ClaimFormatError(f"claim file {target!r} is not valid JSON: {e}") from e
+    return ClaimRecord.from_dict(data)
+
+
+def write_claim(path: PathLike, claim: ClaimRecord) -> None:
+    atomic_write(path, json.dumps(claim.to_dict(), indent=2, sort_keys=True) + "\n")
+
+
+__all__ = [
+    "CANONICAL_SCOPES",
+    "PARAMETERIZED_SCOPE_PREFIXES",
+    "SCOPES",
+    "ConcurrencyError",
+    "LockHeldError",
+    "ClaimFormatError",
+    "ScopeError",
+    "StaleRenameError",
+    "CrossDeviceError",
+    "CollisionError",
+    "AtomicWriteError",
+    "ForeignReleaseError",
+    "LockInfo",
+    "LockHandle",
+    "ClaimRecord",
+    "validate_scope",
+    "acquire_lock",
+    "release_lock",
+    "inspect_lock",
+    "refresh_heartbeat",
+    "classify_lock",
+    "atomic_rename",
+    "atomic_write",
+    "read_claim",
+    "write_claim",
+]

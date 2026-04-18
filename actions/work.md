@@ -305,6 +305,8 @@ If no request files found, report completion and exit.
 2. Move the request file from `do-work/` to `do-work/working/`
 3. Update the frontmatter:
 
+**REQ-002 note:** This state transition is still shown as a raw move in the orchestration doc. When REQ-004 wires claim logic, implement it with `lib.concurrency.atomic_rename(...)` per [actions/concurrency-primitives.md](./concurrency-primitives.md), not shell `mv`.
+
 ```yaml
 ---
 status: claimed
@@ -765,6 +767,8 @@ route: B
 ```bash
 mkdir -p do-work/archive
 ```
+
+**REQ-002 note:** The archive moves in this step should migrate to `lib.concurrency.atomic_rename(...)` when REQ-006 lands. Until then, this doc keeps the current flow explicit without claiming the wiring is already done.
 
 4. **Archive the request file** — behavior depends on whether the REQ has a UR:
 

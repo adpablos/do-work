@@ -151,10 +151,10 @@ Before invoking any coordinated action (do, work, verify-request, verify-plan, c
 Follow the detailed instructions in:
 
 - [session-identity action](./actions/session-identity.md) - Session identity and heartbeat protocol (foundational; every coordinated action establishes identity at Step 0)
+- [concurrency-primitives action](./actions/concurrency-primitives.md) - Shared lockfile, atomic-write, atomic-rename, and claim-file contracts backed by `lib/concurrency.py`
 - [do action](./actions/do.md) - Request capture
 - [work action](./actions/work.md) - Queue processing
 - [verify-request action](./actions/verify-request.md) - Coverage verification of captured requests (runs after capture, or manually)
 - [verify-plan action](./actions/verify-plan.md) - Plan coverage verification (runs after planning in the work action)
 - [cleanup action](./actions/cleanup.md) - Archive consolidation and UR closure
 - [version action](./actions/version.md) - Version, updates & changelog
-

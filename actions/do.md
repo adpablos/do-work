@@ -17,6 +17,8 @@ Both are mandatory. Never create one without the other. This applies to every in
 - A UR without REQ files is pointless — nothing gets queued for the work action
 - The verify action depends on this linkage to evaluate capture quality
 
+Shared coordination helpers for lockfiles, atomic writes, atomic renames, and claim-file parsing now live in [actions/concurrency-primitives.md](./concurrency-primitives.md) and `lib/concurrency.py`. The do action stays focused on capture; later REQs wire those primitives into the coordinated steps that need them.
+
 ## Philosophy
 
 - **Speed over perfection**: This is a rapid capture interface, not a design review

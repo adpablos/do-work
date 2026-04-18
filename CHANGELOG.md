@@ -4,6 +4,18 @@ What's new, what's better, what's different. Most recent stuff on top.
 
 ---
 
+## 0.15.0 — The Lockbox (2026-04-17)
+
+Parallel-safe coordination now has a real runtime behind it. The skill ships a shared concurrency library with lockfiles, atomic writes, atomic renames, and claim-file helpers, plus isolated tests so later REQs can wire it in without inventing their own filesystem tricks.
+
+- Added `lib/concurrency.py` with stdlib-only primitives for exclusive locks, heartbeats, atomic file writes, atomic state transitions, and shared claim-file parsing
+- Added `lib/concurrency_test.py` with isolated unit coverage plus a 20-process race test to prove only one lock holder wins
+- Added `actions/concurrency-primitives.md` as the canonical contract for scope names, lockfile schema, failure modes, and non-goals
+- Updated session/work/do/cleanup docs and `SKILL.md` to point at the shared primitives without prematurely rewiring later REQs
+- Added `do-work/.locks/` to `.gitignore` because lockfiles are runtime state, not history
+
+---
+
 ## 0.14.0 — The Name Tag (2026-04-17)
 
 First foundational REQ of the parallel-safety work lands: every coordinated action now declares a session identity and writes a heartbeat to disk before touching `do-work/`. Nothing else about the skill changes yet — claims, locks, and orphan recovery come next, and they all consume this. Session records live in `do-work/.sessions/` and are gitignored because they are ephemeral runtime state.
@@ -252,4 +264,3 @@ The beginning. Core task capture and processing system with do/work routing, REQ
 - Work loop processing with `do work run`
 - REQ file lifecycle: pending → working → archived
 - Git-aware: auto-commits after each completed request
-

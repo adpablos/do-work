@@ -5,5 +5,8 @@ docs/prd/*.md
 # Session records — ephemeral runtime state per actions/session-identity.md
 do-work/.sessions/
 
+# Lockfiles — ephemeral runtime state per actions/concurrency-primitives.md
+do-work/.locks/
+
 # macOS
 .DS_Store

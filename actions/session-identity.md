@@ -91,7 +91,7 @@ Every action begins with this sequence, before any write to `do-work/` beyond re
 1. If the current process has already established a session record (check via an in-process variable or by matching PID against existing records), skip to step 5.
 2. Generate a `session_id` per the rules above.
 3. Capture `hostname`, `pid`, `started_at` (now, UTC).
-4. Create `do-work/.sessions/` if it does not exist. Write the session record as `do-work/.sessions/<session_id>.json`. **Use the atomic-write primitive from REQ-002 once it is available**; until then, write to a temp name and rename atomically.
+4. Create `do-work/.sessions/` if it does not exist. Write the session record as `do-work/.sessions/<session_id>.json` using `lib.concurrency.atomic_write` (documented in [actions/concurrency-primitives.md](./concurrency-primitives.md)).
 5. Set `operation` to the current action name.
 6. Update `last_heartbeat` to now.
 

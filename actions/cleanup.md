@@ -13,6 +13,8 @@ The archive should be a collection of self-contained UR folders, each containing
 
 Before Pass 1, establish session identity per [actions/session-identity.md](./session-identity.md). Cleanup performs multiple folder moves; every one of those is a coordinated write and must not happen without a session record. If cleanup runs automatically at the end of a work loop, session identity was already established at work's Step 0 — refresh the heartbeat and proceed. If cleanup is invoked standalone (`do work cleanup`), establish a fresh session record before Pass 1.
 
+Shared coordination primitives are defined in [actions/concurrency-primitives.md](./concurrency-primitives.md) and implemented in `lib/concurrency.py`. Cleanup still documents raw moves here because REQ-009 has not wired them yet, but the eventual implementation should use the shared lock and atomic-rename helpers instead of ad-hoc filesystem operations.
+
 Then three passes, in order:
 
 ### Pass 1: Close Completed User Requests

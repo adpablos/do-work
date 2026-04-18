@@ -1,0 +1,220 @@
+# Concurrency Primitives
+
+> **Part of the do-work skill.** Defines the shared concurrency primitives every coordinated action uses. This document is the contract; `lib/concurrency.py` is the implementation. Every other REQ in the parallel-safety batch (REQ-003..REQ-010) consumes primitives from here — none roll their own.
+
+## What This Provides
+
+A filesystem-only toolbox that lets sessions coordinate without races: exclusive lockfiles, atomic renames, atomic writes, a claim file format, and a catalog of canonical lock scopes. All primitives are stdlib-only Python 3 and consult the session-identity record (REQ-001) so every lock knows which session holds it.
+
+This is a **library of primitives**, not a policy. Individual actions decide when and at what scope to use each primitive (see REQ-003..REQ-010). The library does not assume. The rule: **never hand-roll a lock, a claim, or a state transition — call the library.**
+
+## Module Location
+
+```
+lib/
+  __init__.py
+  concurrency.py          # the library
+  concurrency_test.py     # isolated unittest suite (uses tempdir, not live state)
+```
+
+Run tests from the repo root:
+
+```bash
+python3 -m unittest lib.concurrency_test -v
+```
+
+Actions invoke primitives via Python one-liners — example patterns are shown in each section below.
+
+## Agent Invocation Contract
+
+The primitives are called from action markdown by running `python3 -c '...'` (or equivalent) against the `lib.concurrency` module. The action file documents **what** to do; the library enforces **how**. Every primitive:
+
+- Fails loud with a descriptive exception on the first ambiguous signal.
+- Reports holder session ID + operation in lock-contention errors.
+- Makes no hidden decisions on behalf of the caller (no auto-delete, no auto-recover, no TTL guess).
+
+## Primitives
+
+### 1. Exclusive Lockfile
+
+**Contract:** Acquire an exclusive lock by creating a lockfile at a caller-specified path using `O_CREAT | O_EXCL` semantics. A second caller on the same path fails fast with `LockHeldError` — never blocks silently.
+
+**Lockfile on-disk schema** (JSON, `cat`-readable):
+
+```json
+{
+  "session_id": "2026-04-18T00-21-52Z-f2d85402",
+  "operation": "work",
+  "scope": "req-claim:REQ-002",
+  "acquired_at": "2026-04-18T00:22:00Z",
+  "last_heartbeat": "2026-04-18T00:22:00Z",
+  "pid": 21586,
+  "hostname": "alejandro-laptop"
+}
+```
+
+**API:**
+
+- `acquire_lock(path, *, session_id, operation, scope, pid=None, hostname=None, now=None) -> LockHandle`
+- `release_lock(handle_or_path)` — idempotent removal of the lockfile the handle points at. Raises if the lockfile content no longer matches the handle (foreign release attempt).
+- `inspect_lock(path) -> LockInfo | None` — read-only; returns `None` if no lockfile, dataclass with all schema fields otherwise.
+- `refresh_heartbeat(handle_or_path, *, now=None)` — rewrites `last_heartbeat` via atomic write. Callers holding long-running locks use this on the session-identity heartbeat cadence (30 s default).
+
+**Recommended on-disk location:** `do-work/.locks/<scope>.lock` (caller supplies the full path; library does not dictate the root). Lock roots must be in `.gitignore`.
+
+### 2. Stale-Lock Verdict
+
+**Contract:** Classify an existing lock as `live`, `stale`, or `orphaned`. **Never mutates the filesystem.** The caller decides what to do with the verdict — recovery policy is REQ-005's job, not this library's.
+
+**API:**
+
+- `classify_lock(info, *, now, stale_threshold=timedelta(minutes=2)) -> Literal["live", "stale", "orphaned"]`
+
+**Verdict rules:**
+
+- `live` — `now - last_heartbeat < stale_threshold`. The holder is writing heartbeats; leave it alone.
+- `stale` — heartbeat is older than the threshold **but** the PID is still alive on the current host (same `hostname`, `os.kill(pid, 0)` succeeds). The session may be paused; do not auto-recover.
+- `orphaned` — heartbeat is stale **and** the PID is absent on the current host. Eligible for recovery by the caller's policy.
+
+Cross-host cases (`info.hostname != local hostname`) always return `stale` — UR-001 is single-machine; cross-host recovery is out of scope.
+
+### 3. Atomic Rename
+
+**Contract:** Wrap `os.rename` so every state transition (queue→working, working→archive, draft→committed) is named and atomic. Raw `os.rename` and shell `mv` are forbidden for state transitions once this library is available.
+
+**API:**
+
+- `atomic_rename(src, dst, *, transition)` — `transition` is a human-readable label surfaced in error messages (e.g., `"queue→working for REQ-002"`). Raises `StaleRenameError` on `ENOENT`, `CrossDeviceError` on `EXDEV`, `CollisionError` if `dst` already exists (POSIX `rename` overwrites silently — the library refuses).
+
+### 4. Atomic Write
+
+**Contract:** Writes never leave a half-written file visible to a reader. Always write-to-temp-then-rename on the same filesystem.
+
+**API:**
+
+- `atomic_write(path, content, *, mode="w")` — writes to `<path>.tmp.<hex>`, `fsync`s, then `os.rename` onto `path`. The temp name is unique per call so two concurrent writers don't collide on the temp file itself (they may still race on the final rename — last-writer-wins, which is the documented POSIX semantics and is the caller's responsibility to serialize when needed).
+
+### 5. Claim File Format
+
+**Contract:** One JSON schema for every claim file produced by REQ-004 (work claim), REQ-007 (verify claim), REQ-009 (cleanup claim). One parser, one writer.
+
+**Schema:**
+
+```json
+{
+  "claim_id": "REQ-002",
+  "session_id": "2026-04-18T00-21-52Z-f2d85402",
+  "operation": "work",
+  "scope": "req-claim:REQ-002",
+  "affected_paths": ["do-work/working/REQ-002-shared-concurrency-primitives.md"],
+  "acquired_at": "2026-04-18T00:22:00Z",
+  "last_heartbeat": "2026-04-18T00:22:00Z"
+}
+```
+
+**API:**
+
+- `write_claim(path, claim)` — backed by `atomic_write`.
+- `read_claim(path) -> ClaimRecord` — returns a dataclass; raises `ClaimFormatError` on schema mismatch or invalid JSON.
+
+Claim lifecycle (when to create, refresh, release) is **not** defined here — that is per-action policy (REQ-004/REQ-007/REQ-009).
+
+### 6. Standard Lock Scopes
+
+**Canonical catalog.** Scope names are canonical and typed. Ad-hoc scope strings are rejected by `acquire_lock` via `ScopeError`. New scopes must be added to this document **and** to `SCOPES` in `lib/concurrency.py` before they can be used in action code.
+
+| Scope name             | Used by     | Purpose                                                           |
+|------------------------|-------------|-------------------------------------------------------------------|
+| `id-allocation`        | REQ-003     | Global lock for atomic REQ/UR ID allocation during capture.       |
+| `req-claim:<REQ-id>`   | REQ-004     | Per-REQ lock when claiming a queue entry.                         |
+| `ur-archival:<UR-id>`  | REQ-006     | Per-UR lock during final-REQ-done archival.                       |
+| `verify-doc:<path>`    | REQ-007     | Per-document lock during verify-request/verify-plan.              |
+| `cleanup-global`       | REQ-009     | Exclusive lock for the cleanup action.                            |
+| `foreign-edit:<path>`  | REQ-010     | Per-document claim at claim-time / re-verify at commit-time.      |
+
+Parameterized scopes (those with `:<...>`) accept any suffix; the library validates the scope **prefix** against the canonical list.
+
+### 7. Deterministic Failure Messages
+
+Every lock-acquisition failure carries:
+
+- The attempting session's `session_id` and `operation`.
+- The holder's `session_id`, `operation`, `acquired_at`, `last_heartbeat`.
+- The lock path and scope.
+
+Example `LockHeldError` message:
+
+```
+LockHeldError: lock 'do-work/.locks/req-claim:REQ-002.lock' is held
+  scope:         req-claim:REQ-002
+  held_by:       session 2026-04-18T00-10-00Z-deadbeef (operation: work)
+  acquired_at:   2026-04-18T00:10:05Z
+  last_heartbeat:2026-04-18T00:20:45Z
+  attempting:    session 2026-04-18T00-21-52Z-f2d85402 (operation: work)
+```
+
+Actions surface this error verbatim to the user. Do not catch and translate.
+
+## Exceptions
+
+All raised from `lib.concurrency`:
+
+- `LockHeldError` — second acquire on a live lock.
+- `ClaimFormatError` — invalid claim JSON or missing fields.
+- `ScopeError` — unknown scope name.
+- `ForeignReleaseError` — a lock handle no longer matches the on-disk lockfile.
+- `StaleRenameError` — `ENOENT` during rename (source vanished).
+- `CrossDeviceError` — `EXDEV` during rename (not same filesystem).
+- `CollisionError` — destination already exists for `atomic_rename`.
+- `AtomicWriteError` — I/O failure during `atomic_write` (disk full, permissions, etc.).
+
+## Debuggability Guarantee
+
+A user troubleshooting the skill must be able to understand lock/claim state with `ls` and `cat` alone:
+
+- `ls do-work/.locks/` reveals every held lock.
+- `cat do-work/.locks/<scope>.lock` reveals the holder.
+- `cat do-work/working/<something>.claim.json` reveals active claims (when REQ-004..REQ-009 land).
+
+No binary formats. No hidden state outside the documented directories. No database.
+
+## What This Library Does NOT Do
+
+Out of scope for REQ-002 — each item is owned by a later REQ in the batch:
+
+- **Claim lifecycle** (when to create/refresh/release claims) — REQ-004, REQ-007, REQ-009.
+- **Orphan recovery decision** — REQ-005. This library emits the verdict; it does not act on it.
+- **ID allocation** — REQ-003 consumes `id-allocation` scope.
+- **UR archival atomicity** — REQ-006 consumes `ur-archival:<UR-id>` scope.
+- **Foreign-edit detection logic** — REQ-010 consumes `foreign-edit:<path>` scope.
+- **Action wiring.** REQ-002 ships the primitives. Callers are introduced in REQ-003..REQ-010.
+- **Debug CLI.** Skipped by design — `cat` is enough. The optional `do-work debug locks` subcommand flagged in the REQ's Open Questions is **not** shipped; callers use `inspect_lock` directly or `cat` the lockfile.
+
+## Testability
+
+All primitives are exercised by `lib/concurrency_test.py` against a `tempfile.TemporaryDirectory`. Tests include:
+
+- Unit coverage: acquire/release/inspect, classify verdicts, atomic rename failure modes, atomic write visibility, claim round-trip, scope validation.
+- Concurrency coverage: 20 `multiprocessing` workers race on one lock; exactly one wins.
+
+Run from the repo root:
+
+```bash
+python3 -m unittest lib.concurrency_test -v
+```
+
+Tests must pass before any downstream REQ consumes the library. A failing concurrency test indicates the primitive is wrong — **fix the primitive, not the test**.
+
+## Assumed Environment
+
+- **Python 3.9+.** Uses dataclasses, `typing.Literal`, `os.PathLike`, stdlib only.
+- **POSIX-ish filesystem.** Atomic rename within the same filesystem. `os.open(..., O_CREAT | O_EXCL)` semantics available.
+- **Same-host, same-user.** PID liveness via `os.kill(pid, 0)`. Cross-host locking is out of scope.
+
+## Gitignore
+
+Lock roots are ephemeral runtime state and must never be committed. Add to `.gitignore`:
+
+```
+do-work/.locks/
+```
