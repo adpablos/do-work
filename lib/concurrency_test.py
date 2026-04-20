@@ -13,6 +13,8 @@ from unittest import mock
 
 from lib.concurrency import (
     AtomicWriteError,
+    CleanupClaimHandle,
+    CleanupClaimRecord,
     ConcurrencyError,
     archive_completed_request,
     archive_legacy_context_if_complete,
@@ -43,14 +45,18 @@ from lib.concurrency import (
     atomic_write,
     capture_claim_tree_state,
     claim_work_request,
+    claim_cleanup,
     classify_lock,
     inspect_session_record,
     inspect_work_claim_recovery,
     inspect_lock,
     read_claim,
+    read_cleanup_claim,
     read_session_record,
     recover_orphaned_work_claim,
+    refresh_cleanup_claim_heartbeat,
     refresh_claim_heartbeat,
+    release_cleanup,
     release_claim,
     refresh_heartbeat,
     release_lock,
@@ -58,6 +64,7 @@ from lib.concurrency import (
     verify_and_stage_claim_scope,
     write_session_record,
     write_claim,
+    write_cleanup_claim,
 )
 
 
@@ -121,6 +128,32 @@ def _ur_archival_race_worker(
         return
 
     result_queue.put(("ok", session_id, result.outcome, result.archive_path))
+
+
+def _cleanup_claim_race_worker(
+    do_work_root: str,
+    start_event,
+    release_event,
+    result_queue,
+) -> None:
+    start_event.wait()
+    session_id = f"session-{os.getpid()}"
+    try:
+        handle = claim_cleanup(
+            do_work_root,
+            session_id=session_id,
+            operation="cleanup",
+        )
+    except LockHeldError as exc:
+        result_queue.put(("held", session_id, str(exc)))
+        return
+    except Exception as exc:
+        result_queue.put(("error", session_id, type(exc).__name__, str(exc)))
+        return
+
+    result_queue.put(("acquired", session_id, handle.path))
+    release_event.wait(timeout=2)
+    release_cleanup(handle)
 
 
 class ConcurrencyPrimitivesTest(unittest.TestCase):
@@ -576,6 +609,134 @@ class ConcurrencyPrimitivesTest(unittest.TestCase):
         write_claim(path, claim)
         loaded = read_claim(path)
         self.assertEqual(loaded, claim)
+
+    def test_claim_cleanup_writes_cleanup_claim_and_lock(self) -> None:
+        do_work_root = self.root / "do-work"
+        handle = claim_cleanup(
+            do_work_root,
+            session_id="session-1",
+            operation="cleanup",
+            now=datetime(2026, 4, 20, 22, 10, tzinfo=timezone.utc),
+        )
+
+        claim_path = do_work_root / ".claims" / "cleanup.claim.json"
+        lock_path = do_work_root / ".locks" / "cleanup-global.lock"
+        self.assertEqual(handle.path, str(claim_path))
+        self.assertTrue(claim_path.exists())
+        self.assertTrue(lock_path.exists())
+
+        claim = read_cleanup_claim(claim_path)
+        self.assertEqual(
+            claim,
+            CleanupClaimRecord(
+                session_id="session-1",
+                started_at="2026-04-20T22:10:00Z",
+                last_heartbeat="2026-04-20T22:10:00Z",
+                operation="cleanup",
+            ),
+        )
+        release_cleanup(handle)
+        self.assertFalse(claim_path.exists())
+        self.assertFalse(lock_path.exists())
+
+    def test_refresh_cleanup_claim_heartbeat_updates_claimfile(self) -> None:
+        path = self.root / "do-work" / ".claims" / "cleanup.claim.json"
+        claim = CleanupClaimRecord(
+            session_id="session-1",
+            started_at="2026-04-20T22:00:00Z",
+            last_heartbeat="2026-04-20T22:00:00Z",
+            operation="cleanup",
+        )
+        handle = CleanupClaimHandle(
+            lock=LockHandle(
+                path=str(self.root / "do-work" / ".locks" / "cleanup-global.lock"),
+                info=LockInfo(
+                    session_id="session-1",
+                    operation="cleanup",
+                    scope="cleanup-global",
+                    acquired_at="2026-04-20T22:00:00Z",
+                    last_heartbeat="2026-04-20T22:00:00Z",
+                    pid=1234,
+                    hostname="test-host",
+                ),
+            ),
+            path=str(path),
+            claim=claim,
+        )
+
+        write_cleanup_claim(path, claim)
+        refresh_cleanup_claim_heartbeat(
+            handle,
+            now=datetime(2026, 4, 20, 22, 0, 45, tzinfo=timezone.utc),
+        )
+
+        loaded = read_cleanup_claim(path)
+        self.assertEqual(loaded.last_heartbeat, "2026-04-20T22:00:45Z")
+        self.assertEqual(handle.claim.last_heartbeat, "2026-04-20T22:00:45Z")
+
+    def test_claim_cleanup_fails_loud_if_claim_file_already_exists(self) -> None:
+        do_work_root = self.root / "do-work"
+        claim_path = do_work_root / ".claims" / "cleanup.claim.json"
+        write_cleanup_claim(
+            claim_path,
+            CleanupClaimRecord(
+                session_id="session-dead",
+                started_at="2026-04-20T21:00:00Z",
+                last_heartbeat="2026-04-20T21:30:00Z",
+                operation="cleanup",
+            ),
+        )
+
+        with self.assertRaises(ConcurrencyError) as ctx:
+            claim_cleanup(
+                do_work_root,
+                session_id="session-1",
+                operation="cleanup",
+            )
+
+        message = str(ctx.exception)
+        self.assertIn("session-dead", message)
+        self.assertIn("REQ-005 evidence path", message)
+        self.assertFalse((do_work_root / ".locks" / "cleanup-global.lock").exists())
+
+    def test_parallel_cleanup_claims_produce_one_winner_and_named_holder(self) -> None:
+        do_work_root = self.root / "do-work"
+        ctx = multiprocessing.get_context("spawn")
+        start_event = ctx.Event()
+        release_event = ctx.Event()
+        result_queue = ctx.Queue()
+        processes = [
+            ctx.Process(
+                target=_cleanup_claim_race_worker,
+                args=(str(do_work_root), start_event, release_event, result_queue),
+            )
+            for _ in range(2)
+        ]
+
+        for process in processes:
+            process.start()
+
+        start_event.set()
+        results = [result_queue.get(timeout=5) for _ in range(2)]
+        release_event.set()
+
+        for process in processes:
+            process.join(timeout=5)
+            self.assertEqual(process.exitcode, 0)
+
+        acquired = [result for result in results if result[0] == "acquired"]
+        held = [result for result in results if result[0] == "held"]
+        errors = [result for result in results if result[0] == "error"]
+        self.assertEqual(errors, [])
+        self.assertEqual(len(acquired), 1)
+        self.assertEqual(len(held), 1)
+
+        winner_session = acquired[0][1]
+        loser_message = held[0][2]
+        self.assertIn(winner_session, loser_message)
+        self.assertIn("cleanup-global", loser_message)
+        self.assertFalse((do_work_root / ".claims" / "cleanup.claim.json").exists())
+        self.assertFalse((do_work_root / ".locks" / "cleanup-global.lock").exists())
 
     def test_refresh_claim_heartbeat_updates_claimfile(self) -> None:
         claim = ClaimRecord(

@@ -4,6 +4,16 @@ What's new, what's better, what's different. Most recent stuff on top.
 
 ---
 
+## 0.20.0 — The Mop Guard (2026-04-20)
+
+Cleanup stopped freelancing. Only one cleanup run can hold the room at a time now, and if another session is already sweeping, you get told exactly who is holding the lock instead of wandering into a second pass.
+
+- Added a cleanup-specific global claim/lock flow in `lib/concurrency.py`, including heartbeat refresh and explicit fail-loud behavior for ambiguous stale state
+- Added regression coverage for cleanup claim lifecycle plus the required two-cleanup race with one winner and one named holder
+- Updated the cleanup/concurrency docs to lock in the short-lock + re-scan model and explicitly reject a `force` bypass
+- Archived `REQ-009` as completed
+- Bumped the public skill version to `0.20.0`
+
 ## 0.19.0 — The Scope Fence (2026-04-20)
 
 Work commits keep to their lane now. A claimed REQ snapshots Git tree state up front, freezes its commit scope before implementation, and refuses to commit if anything foreign shows up outside that fence.

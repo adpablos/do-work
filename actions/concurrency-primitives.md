@@ -121,9 +121,9 @@ Cross-host cases (`info.hostname != local hostname`) always return `stale` — U
 - If the placeholder write fails, the allocator releases the lock and removes any directory it created.
 - If the "next" ID already exists anywhere authoritative, allocation fails loudly with the conflicting path.
 
-### 6. Claim File Format
+### 6. Work/Verify Claim File Format
 
-**Contract:** One JSON schema for every claim file produced by REQ-004 (work claim), REQ-007 (verify claim), REQ-009 (cleanup claim). One parser, one writer.
+**Contract:** Work and verify claims share one JSON schema. Cleanup uses a dedicated global claim shape because it claims the cleanup run itself rather than a REQ/file path.
 
 **Schema:**
 
@@ -160,6 +160,38 @@ Cross-host cases (`info.hostname != local hostname`) always return `stale` — U
 - `verify_and_stage_claim_scope(repo_root, *, claim_handle_or_path, current_request_path, expected_session_id=None, now=None, stale_threshold=timedelta(minutes=2))` — REQ-010's commit gate: re-verify `HEAD`, reject foreign dirty paths, and stage only the scoped snapshot.
 
 Claim lifecycle (when to create, refresh, release) is **not** defined here — that is per-action policy (REQ-004/REQ-007/REQ-009).
+
+### 6.1 Cleanup Claim + Global Lock
+
+**Contract:** Cleanup takes an exclusive global lock plus a lightweight heartbeat claim. The lock serializes scan/decision windows. The cleanup claim leaves a readable breadcrumb naming the active cleanup session even when the action is between re-scans.
+
+**Cleanup claim schema:**
+
+```json
+{
+  "session_id": "2026-04-20T22-03-44Z-11f53308",
+  "started_at": "2026-04-20T22:03:44Z",
+  "last_heartbeat": "2026-04-20T22:03:44Z",
+  "operation": "cleanup"
+}
+```
+
+**API:**
+
+- `claim_cleanup(do_work_root, *, session_id, operation="cleanup", now=None) -> CleanupClaimHandle`
+- `read_cleanup_claim(path) -> CleanupClaimRecord`
+- `write_cleanup_claim(path, claim)` — backed by `atomic_write`
+- `refresh_cleanup_claim_heartbeat(handle_or_path, *, now=None)`
+- `refresh_cleanup_heartbeat(handle, *, now=None)` — refreshes the global lockfile and cleanup claim together
+- `release_cleanup_claim(handle_or_path, *, expected_session_id=None)`
+- `release_cleanup(handle, *, expected_session_id=None)` — releases the cleanup claim first, then the global lock
+
+**Behavior notes:**
+
+- `claim_cleanup(...)` acquires `do-work/.locks/cleanup-global.lock` first, then writes `do-work/.claims/cleanup.claim.json`.
+- A second cleanup run fails immediately with `LockHeldError`, and the message names the holder session.
+- If the cleanup claim already exists without a live caller holding the global lock, cleanup fails loud and tells the caller to use REQ-005's explicit recovery path. There is no force flag.
+- The global lock is intentionally short-lived: cleanup scans under the lock, performs one `atomic_rename(...)`, then re-scans before deciding the next move.
 
 ### 6.5 Session Record + Explicit Recovery Helpers
 

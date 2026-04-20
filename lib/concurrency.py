@@ -382,6 +382,44 @@ class WorkClaimHandle:
 
 
 @dataclass(frozen=True)
+class CleanupClaimRecord:
+    session_id: str
+    started_at: str
+    last_heartbeat: str
+    operation: str
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "CleanupClaimRecord":
+        required = {"session_id", "started_at", "last_heartbeat", "operation"}
+        missing = required - set(d)
+        if missing:
+            raise ClaimFormatError(
+                f"cleanup claim missing fields: {sorted(missing)}"
+            )
+        operation = d["operation"]
+        if operation != "cleanup":
+            raise ClaimFormatError(
+                f"cleanup claim operation must be 'cleanup', got {operation!r}"
+            )
+        return cls(
+            session_id=d["session_id"],
+            started_at=d["started_at"],
+            last_heartbeat=d["last_heartbeat"],
+            operation=operation,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class CleanupClaimHandle:
+    lock: LockHandle
+    path: str
+    claim: CleanupClaimRecord
+
+
+@dataclass(frozen=True)
 class ClaimFileFingerprint:
     path: str
     sha256: Optional[str]
@@ -712,6 +750,28 @@ def _write_claim_exclusive(path: str, claim: ClaimRecord) -> None:
         raise
 
 
+def _write_cleanup_claim_exclusive(path: str, claim: CleanupClaimRecord) -> None:
+    """Create path with O_CREAT|O_EXCL and write the cleanup-claim JSON."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(claim.to_dict(), f, indent=2, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+
+
 def _inspect_lock_after_contention(
     path: str,
     *,
@@ -772,6 +832,16 @@ def _work_claim_path(working_request_path: Path) -> Path:
 def _iter_work_claim_paths(do_work_root: PathLike) -> Iterable[Path]:
     root = _coerce_do_work_root(do_work_root)
     yield from (root / "working").glob("*.claim.json")
+
+
+def _cleanup_lock_path(do_work_root: PathLike) -> Path:
+    root = _coerce_do_work_root(do_work_root)
+    return root / ".locks" / "cleanup-global.lock"
+
+
+def _cleanup_claim_path(do_work_root: PathLike) -> Path:
+    root = _coerce_do_work_root(do_work_root)
+    return root / ".claims" / "cleanup.claim.json"
 
 
 def _session_record_path(do_work_root: PathLike, session_id: str) -> Path:
@@ -1295,6 +1365,24 @@ def write_claim(path: PathLike, claim: ClaimRecord) -> None:
     atomic_write(path, json.dumps(claim.to_dict(), indent=2, sort_keys=True) + "\n")
 
 
+def read_cleanup_claim(path: PathLike) -> CleanupClaimRecord:
+    target = os.fspath(path)
+    try:
+        with open(target, "r") as f:
+            data = json.load(f)
+    except FileNotFoundError as e:
+        raise ClaimFormatError(f"cleanup claim file {target!r} not found") from e
+    except json.JSONDecodeError as e:
+        raise ClaimFormatError(
+            f"cleanup claim file {target!r} is not valid JSON: {e}"
+        ) from e
+    return CleanupClaimRecord.from_dict(data)
+
+
+def write_cleanup_claim(path: PathLike, claim: CleanupClaimRecord) -> None:
+    atomic_write(path, json.dumps(claim.to_dict(), indent=2, sort_keys=True) + "\n")
+
+
 def release_claim(
     handle_or_path: Union[ClaimHandle, PathLike],
     *,
@@ -1318,6 +1406,38 @@ def release_claim(
     if expected_session_id is not None and current.session_id != expected_session_id:
         raise ForeignReleaseError(
             f"refusing to release claim {path!r}: held by session "
+            f"{current.session_id!r}, expected {expected_session_id!r}"
+        )
+
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def release_cleanup_claim(
+    handle_or_path: Union[CleanupClaimHandle, PathLike],
+    *,
+    expected_session_id: Optional[str] = None,
+) -> None:
+    """Remove a cleanup claim file, optionally asserting ownership."""
+    if isinstance(handle_or_path, CleanupClaimHandle):
+        path = handle_or_path.path
+        if expected_session_id is None:
+            expected_session_id = handle_or_path.claim.session_id
+    else:
+        path = os.fspath(handle_or_path)
+
+    try:
+        current = read_cleanup_claim(path)
+    except ClaimFormatError:
+        if not os.path.exists(path):
+            return
+        raise
+
+    if expected_session_id is not None and current.session_id != expected_session_id:
+        raise ForeignReleaseError(
+            f"refusing to release cleanup claim {path!r}: held by session "
             f"{current.session_id!r}, expected {expected_session_id!r}"
         )
 
@@ -1360,6 +1480,121 @@ def refresh_claim_heartbeat(
     write_claim(path, updated)
     if isinstance(handle_or_path, ClaimHandle):
         handle_or_path.claim = updated
+
+
+def refresh_cleanup_claim_heartbeat(
+    handle_or_path: Union[CleanupClaimHandle, PathLike],
+    *,
+    now: Optional[datetime] = None,
+) -> None:
+    """Rewrite last_heartbeat on a cleanup claim file via atomic write."""
+    if isinstance(handle_or_path, CleanupClaimHandle):
+        path = handle_or_path.path
+        expected_session_id = handle_or_path.claim.session_id
+    else:
+        path = os.fspath(handle_or_path)
+        expected_session_id = None
+
+    current = read_cleanup_claim(path)
+    if expected_session_id is not None and current.session_id != expected_session_id:
+        raise ForeignReleaseError(
+            f"refusing to refresh cleanup claim heartbeat on {path!r}: held by "
+            f"session {current.session_id!r}, expected {expected_session_id!r}"
+        )
+
+    updated = CleanupClaimRecord(
+        session_id=current.session_id,
+        started_at=current.started_at,
+        last_heartbeat=_iso(now or _utcnow()),
+        operation=current.operation,
+    )
+    write_cleanup_claim(path, updated)
+    if isinstance(handle_or_path, CleanupClaimHandle):
+        handle_or_path.claim = updated
+
+
+def claim_cleanup(
+    do_work_root: PathLike,
+    *,
+    session_id: str,
+    operation: str = "cleanup",
+    now: Optional[datetime] = None,
+) -> CleanupClaimHandle:
+    """Claim the global cleanup run with a short lock plus a heartbeat file."""
+    if operation != "cleanup":
+        raise ConcurrencyError(
+            f"cleanup claim operation must be 'cleanup', got {operation!r}"
+        )
+
+    root = _coerce_do_work_root(do_work_root)
+    lock = acquire_lock(
+        _cleanup_lock_path(root),
+        session_id=session_id,
+        operation=operation,
+        scope="cleanup-global",
+        now=now,
+    )
+    claim_path = _cleanup_claim_path(root)
+    now_s = _iso(now or _utcnow())
+    claim = CleanupClaimRecord(
+        session_id=session_id,
+        started_at=now_s,
+        last_heartbeat=now_s,
+        operation=operation,
+    )
+    try:
+        _write_cleanup_claim_exclusive(os.fspath(claim_path), claim)
+    except FileExistsError:
+        try:
+            existing = read_cleanup_claim(claim_path)
+            message = (
+                f"cleanup claim {os.fspath(claim_path)!r} already exists\n"
+                f"  held_by:        session {existing.session_id} "
+                f"(operation: {existing.operation})\n"
+                f"  started_at:     {existing.started_at}\n"
+                f"  last_heartbeat: {existing.last_heartbeat}\n"
+                "  remediation:    fail loud and recover explicitly via the "
+                "REQ-005 evidence path before retrying."
+            )
+        except ClaimFormatError as exc:
+            message = (
+                f"cleanup claim {os.fspath(claim_path)!r} already exists but could "
+                f"not be read cleanly: {exc}\n"
+                "  remediation:    fail loud and recover explicitly via the "
+                "REQ-005 evidence path before retrying."
+            )
+        release_lock(lock)
+        raise ConcurrencyError(message)
+    except Exception:
+        release_lock(lock)
+        raise
+
+    return CleanupClaimHandle(
+        lock=lock,
+        path=os.fspath(claim_path),
+        claim=claim,
+    )
+
+
+def refresh_cleanup_heartbeat(
+    handle: CleanupClaimHandle,
+    *,
+    now: Optional[datetime] = None,
+) -> None:
+    """Refresh the cleanup lockfile and cleanup claim with the same timestamp."""
+    refreshed_at = now or _utcnow()
+    refresh_heartbeat(handle.lock, now=refreshed_at)
+    refresh_cleanup_claim_heartbeat(handle, now=refreshed_at)
+
+
+def release_cleanup(
+    handle: CleanupClaimHandle,
+    *,
+    expected_session_id: Optional[str] = None,
+) -> None:
+    """Release the cleanup claim first, then drop the global cleanup lock."""
+    release_cleanup_claim(handle, expected_session_id=expected_session_id)
+    release_lock(handle.lock)
 
 
 def claim_work_request(
@@ -2298,6 +2533,8 @@ __all__ = [
     "LockHandle",
     "ClaimHandle",
     "WorkClaimHandle",
+    "CleanupClaimRecord",
+    "CleanupClaimHandle",
     "ClaimFileFingerprint",
     "ClaimTreeState",
     "ClaimRecord",
@@ -2320,8 +2557,15 @@ __all__ = [
     "inspect_session_record",
     "read_claim",
     "write_claim",
+    "read_cleanup_claim",
+    "write_cleanup_claim",
     "release_claim",
+    "release_cleanup_claim",
     "refresh_claim_heartbeat",
+    "refresh_cleanup_claim_heartbeat",
+    "claim_cleanup",
+    "refresh_cleanup_heartbeat",
+    "release_cleanup",
     "claim_work_request",
     "capture_claim_tree_state",
     "verify_and_stage_claim_scope",

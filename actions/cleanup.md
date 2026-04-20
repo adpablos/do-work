@@ -13,7 +13,15 @@ The archive should be a collection of self-contained UR folders, each containing
 
 Before Pass 1, establish session identity per [actions/session-identity.md](./session-identity.md). Cleanup performs multiple folder moves; every one of those is a coordinated write and must not happen without a session record. If cleanup runs automatically at the end of a work loop, session identity was already established at work's Step 0 — refresh the heartbeat and proceed. If cleanup is invoked standalone (`do work cleanup`), establish a fresh session record before Pass 1.
 
-Shared coordination primitives are defined in [actions/concurrency-primitives.md](./concurrency-primitives.md) and implemented in `lib/concurrency.py`. REQ-006 chose **option (b)** for coordination with cleanup: work uses a short per-UR archival lock, while cleanup keeps its own short global lock and re-scans between structural moves instead of assuming the initial scan stays valid. Cleanup still documents raw moves here because REQ-009 has not wired the global lock yet, but the eventual implementation should use the shared helpers instead of ad-hoc filesystem operations.
+Shared coordination primitives are defined in [actions/concurrency-primitives.md](./concurrency-primitives.md) and implemented in `lib/concurrency.py`. REQ-006 chose **option (b)** for coordination with cleanup and REQ-009 now wires it in:
+
+- Start cleanup with `claim_cleanup(do_work_root, session_id="<current-session-id>", operation="cleanup")`.
+- That helper acquires `do-work/.locks/cleanup-global.lock` and writes `do-work/.claims/cleanup.claim.json` with `{session_id, started_at, last_heartbeat, operation: "cleanup"}`.
+- If another cleanup is active, fail immediately with the holder session ID from `LockHeldError`. No silent second pass and no force flag.
+- Hold the global lock only while scanning and deciding the next structural move. The move itself must still be a single `atomic_rename(...)` transition, then cleanup re-scans from scratch before deciding the next move.
+- If the lock/claim looks stale, fail loud and use the explicit REQ-005 evidence path. Cleanup does not guess and does not auto-recover.
+
+The practical rule is simple: **scan under the global cleanup lock, perform exactly one atomic move, then re-scan.** That keeps cleanup serialized against itself without making REQ-006's per-UR archival path wait on a long global lock.
 
 Then three passes, in order:
 
@@ -30,7 +38,7 @@ For each UR folder in `do-work/user-requests/`:
 3. If **ALL** REQs are completed:
    - Re-scan the same UR immediately before moving anything; cleanup must tolerate work archiving the UR between scans
    - Gather any loose completed REQ files from `do-work/archive/` root into the UR folder
-   - Move the entire UR folder to `do-work/archive/UR-NNN/` (eventual implementation: `archive_user_request_if_complete(..., operation="cleanup")`)
+   - Move the entire UR folder to `do-work/archive/UR-NNN/` by calling `archive_user_request_if_complete(..., operation="cleanup")` while the cleanup claim is active
    - Report: `Archived UR-NNN (all N REQs complete)`
 4. If **NOT all** REQs are completed:
    - Leave the UR folder in `user-requests/` — it's not ready yet
@@ -65,6 +73,8 @@ Check for UR folders that ended up in wrong locations within the archive.
 
 Also check for and consolidate any loose CONTEXT-*.md files:
 - Move to `do-work/archive/legacy/` alongside legacy REQs
+
+Between every structural move above, re-run the authoritative scan before deciding the next move. Cleanup's global lock protects the decision window; REQ-006's per-UR archival lock protects the shared parent move itself.
 
 ## Reporting
 
@@ -113,3 +123,4 @@ do-work/archive/
 - Touch files in `do-work/` root (the queue) or `do-work/working/` — those are the work action's responsibility
 - Archive UR folders that still have pending/in-progress REQs
 - Process any REQ files (use the work action for that)
+- Bypass a live cleanup claim with a force flag — recovery is explicit and fail-loud
