@@ -2,7 +2,7 @@
 
 > **Part of the do-work skill.** Handles version reporting and update checks.
 
-**Current version**: 0.18.0
+**Current version**: 0.19.0
 
 **Upstream**: https://raw.githubusercontent.com/adpablos/do-work/main/actions/version.md
 

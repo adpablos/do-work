@@ -4,6 +4,16 @@ What's new, what's better, what's different. Most recent stuff on top.
 
 ---
 
+## 0.19.0 — The Scope Fence (2026-04-20)
+
+Work commits keep to their lane now. A claimed REQ snapshots Git tree state up front, freezes its commit scope before implementation, and refuses to commit if anything foreign shows up outside that fence.
+
+- Added claim-sidecar tree snapshots plus scoped commit verification/staging helpers in `lib/concurrency.py`
+- Added Git-backed regression tests for dirty-tree refusal, foreign edits between claim and commit, and scoped staging
+- Rewrote `actions/work.md` to document the tree-state contract and replace `git add -A` with scoped re-verification
+- Archived `REQ-010` as completed
+- Bumped the public skill version to `0.19.0`
+
 ## 0.18.0 — The Archive Handshake (2026-04-20)
 
 The last-REQ archive move stops freelancing now. Work archives the finished REQ first, then takes a short per-UR lock to decide whether the parent UR or shared legacy CONTEXT can move, so concurrent finishers stop tripping over the same folder.

@@ -9,11 +9,13 @@ Stdlib only. Python 3.9+.
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import os
 import re
 import secrets
 import socket
+import subprocess
 import tempfile
 import time
 from dataclasses import asdict, dataclass
@@ -145,6 +147,10 @@ class SessionFormatError(ConcurrencyError):
 
 class RecoveryNotAllowedError(ConcurrencyError):
     """Raised when explicit orphan recovery is attempted without clear evidence."""
+
+
+class TreeStateViolationError(ConcurrencyError):
+    """Raised when the claim-time or commit-time tree-state contract is violated."""
 
 
 @dataclass(frozen=True)
@@ -376,6 +382,75 @@ class WorkClaimHandle:
 
 
 @dataclass(frozen=True)
+class ClaimFileFingerprint:
+    path: str
+    sha256: Optional[str]
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ClaimFileFingerprint":
+        required = {"path", "sha256"}
+        missing = required - set(d)
+        if missing:
+            raise ClaimFormatError(
+                f"claim file fingerprint missing fields: {sorted(missing)}"
+            )
+        return cls(path=d["path"], sha256=d["sha256"])
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"path": self.path, "sha256": self.sha256}
+
+
+@dataclass(frozen=True)
+class ClaimTreeState:
+    repo_root: str
+    head_sha: str
+    captured_at: str
+    preexisting_dirty_paths: tuple[str, ...]
+    scope_paths: tuple[str, ...]
+    scope_fingerprints: tuple[ClaimFileFingerprint, ...]
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ClaimTreeState":
+        required = {
+            "repo_root",
+            "head_sha",
+            "captured_at",
+            "preexisting_dirty_paths",
+            "scope_paths",
+            "scope_fingerprints",
+        }
+        missing = required - set(d)
+        if missing:
+            raise ClaimFormatError(
+                f"claim tree_state missing fields: {sorted(missing)}"
+            )
+        return cls(
+            repo_root=d["repo_root"],
+            head_sha=d["head_sha"],
+            captured_at=d["captured_at"],
+            preexisting_dirty_paths=tuple(d["preexisting_dirty_paths"]),
+            scope_paths=tuple(d["scope_paths"]),
+            scope_fingerprints=tuple(
+                ClaimFileFingerprint.from_dict(item)
+                for item in d["scope_fingerprints"]
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "repo_root": self.repo_root,
+            "head_sha": self.head_sha,
+            "captured_at": self.captured_at,
+            "preexisting_dirty_paths": list(self.preexisting_dirty_paths),
+            "scope_paths": list(self.scope_paths),
+            "scope_fingerprints": [
+                fingerprint.to_dict()
+                for fingerprint in self.scope_fingerprints
+            ],
+        }
+
+
+@dataclass(frozen=True)
 class ClaimRecord:
     claim_id: str
     session_id: str
@@ -384,6 +459,7 @@ class ClaimRecord:
     affected_paths: tuple[str, ...]
     acquired_at: str
     last_heartbeat: str
+    tree_state: Optional[ClaimTreeState] = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ClaimRecord":
@@ -405,12 +481,28 @@ class ClaimRecord:
             affected_paths=tuple(d["affected_paths"]),
             acquired_at=d["acquired_at"],
             last_heartbeat=d["last_heartbeat"],
+            tree_state=(
+                None
+                if d.get("tree_state") is None
+                else ClaimTreeState.from_dict(d["tree_state"])
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["affected_paths"] = list(self.affected_paths)
+        if self.tree_state is None:
+            d["tree_state"] = None
+        else:
+            d["tree_state"] = self.tree_state.to_dict()
         return d
+
+
+@dataclass(frozen=True)
+class ScopedStageResult:
+    claim_id: str
+    head_sha: str
+    staged_paths: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -685,6 +777,160 @@ def _iter_work_claim_paths(do_work_root: PathLike) -> Iterable[Path]:
 def _session_record_path(do_work_root: PathLike, session_id: str) -> Path:
     root = _coerce_do_work_root(do_work_root)
     return root / ".sessions" / f"{session_id}.json"
+
+
+def _coerce_repo_root(path: PathLike) -> Path:
+    return Path(os.fspath(path)).resolve()
+
+
+def _discover_repo_root(start_path: PathLike) -> Optional[Path]:
+    start = Path(os.fspath(start_path))
+    if start.is_file():
+        start = start.parent
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=os.fspath(start),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    resolved = proc.stdout.strip()
+    if not resolved:
+        return None
+    return Path(resolved).resolve()
+
+
+def _run_git(repo_root: PathLike, *args: str) -> str:
+    root = _coerce_repo_root(repo_root)
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=os.fspath(root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise ConcurrencyError(
+            f"failed to run git {' '.join(args)!r} from {os.fspath(root)!r}: {exc}"
+        ) from exc
+    if proc.returncode != 0:
+        stderr = proc.stderr.strip()
+        raise ConcurrencyError(
+            f"git {' '.join(args)!r} failed in {os.fspath(root)!r}: "
+            f"{stderr or 'unknown git error'}"
+        )
+    return proc.stdout
+
+
+def _git_head(repo_root: PathLike) -> str:
+    return _run_git(repo_root, "rev-parse", "HEAD").strip()
+
+
+def _normalize_repo_relative_path(repo_root: PathLike, path: PathLike) -> str:
+    root = _coerce_repo_root(repo_root)
+    candidate = Path(os.fspath(path))
+    if candidate.is_absolute():
+        try:
+            candidate = candidate.resolve().relative_to(root)
+        except ValueError as exc:
+            raise ConcurrencyError(
+                f"path {os.fspath(path)!r} is outside repo root {os.fspath(root)!r}"
+            ) from exc
+    return candidate.as_posix()
+
+
+def _git_dirty_paths(repo_root: PathLike) -> tuple[str, ...]:
+    tracked = {
+        line.strip()
+        for line in _run_git(repo_root, "diff", "--name-only", "HEAD", "--").splitlines()
+        if line.strip()
+    }
+    untracked = {
+        line.strip()
+        for line in _run_git(
+            repo_root,
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+        ).splitlines()
+        if line.strip()
+    }
+    return tuple(sorted(tracked | untracked))
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _capture_scope_fingerprints(
+    repo_root: PathLike,
+    scope_paths: Iterable[PathLike],
+) -> tuple[ClaimFileFingerprint, ...]:
+    root = _coerce_repo_root(repo_root)
+    normalized = sorted(
+        {
+            _normalize_repo_relative_path(root, path)
+            for path in scope_paths
+        }
+    )
+    fingerprints: list[ClaimFileFingerprint] = []
+    for relative_path in normalized:
+        target = root / relative_path
+        sha256: Optional[str]
+        if target.exists():
+            if not target.is_file():
+                raise ConcurrencyError(
+                    f"claim scope path {relative_path!r} exists but is not a file"
+                )
+            sha256 = _sha256_file(target)
+        else:
+            sha256 = None
+        fingerprints.append(
+            ClaimFileFingerprint(path=relative_path, sha256=sha256)
+        )
+    return tuple(fingerprints)
+
+
+def _build_claim_tree_state(
+    repo_root: PathLike,
+    *,
+    captured_at: str,
+    preexisting_dirty_paths: Iterable[str],
+    scope_paths: Iterable[PathLike],
+    head_sha: Optional[str] = None,
+) -> ClaimTreeState:
+    root = _coerce_repo_root(repo_root)
+    normalized_dirty = tuple(
+        sorted(
+            {
+                _normalize_repo_relative_path(root, path)
+                for path in preexisting_dirty_paths
+            }
+        )
+    )
+    scope_fingerprints = _capture_scope_fingerprints(root, scope_paths)
+    normalized_scope = tuple(
+        fingerprint.path
+        for fingerprint in scope_fingerprints
+    )
+    return ClaimTreeState(
+        repo_root=os.fspath(root),
+        head_sha=head_sha or _git_head(root),
+        captured_at=captured_at,
+        preexisting_dirty_paths=normalized_dirty,
+        scope_paths=normalized_scope,
+        scope_fingerprints=scope_fingerprints,
+    )
 
 
 _FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n?", re.DOTALL)
@@ -1109,6 +1355,7 @@ def refresh_claim_heartbeat(
         affected_paths=current.affected_paths,
         acquired_at=current.acquired_at,
         last_heartbeat=_iso(now or _utcnow()),
+        tree_state=current.tree_state,
     )
     write_claim(path, updated)
     if isinstance(handle_or_path, ClaimHandle):
@@ -1121,6 +1368,8 @@ def claim_work_request(
     request_path: PathLike,
     session_id: str,
     operation: str = "work",
+    repo_root: Optional[PathLike] = None,
+    refuse_dirty_tree: bool = True,
     now: Optional[datetime] = None,
 ) -> WorkClaimHandle:
     """Claim a queued REQ for the work action with an exclusive claim file.
@@ -1141,6 +1390,26 @@ def claim_work_request(
     os.makedirs(working_dir, exist_ok=True)
     working_request = working_dir / queue_request.name
     claim_path = _work_claim_path(working_request)
+    repo_root_path = (
+        _coerce_repo_root(repo_root)
+        if repo_root is not None
+        else _discover_repo_root(root.parent)
+    )
+    claim_time_dirty_paths: tuple[str, ...] = ()
+    claim_time_head_sha: Optional[str] = None
+
+    if repo_root_path is not None:
+        claim_time_dirty_paths = _git_dirty_paths(repo_root_path)
+        claim_time_head_sha = _git_head(repo_root_path)
+        if claim_time_dirty_paths and refuse_dirty_tree:
+            dirty_display = ", ".join(claim_time_dirty_paths)
+            raise TreeStateViolationError(
+                f"refusing to claim {req_id}: git working tree is already dirty\n"
+                f"  session:      {session_id} (operation: {operation})\n"
+                f"  dirty_paths:  {dirty_display}\n"
+                "  remediation:  clean, stash, or commit the existing work before "
+                "claiming this REQ."
+            )
 
     for existing_path in _iter_work_claim_paths(root):
         existing = _inspect_claim_after_contention(os.fspath(existing_path))
@@ -1186,10 +1455,200 @@ def claim_work_request(
         release_claim(claim_path, expected_session_id=session_id)
         raise
 
+    if repo_root_path is not None:
+        tree_state = _build_claim_tree_state(
+            repo_root_path,
+            captured_at=now_s,
+            preexisting_dirty_paths=claim_time_dirty_paths,
+            scope_paths=(working_request,),
+            head_sha=claim_time_head_sha,
+        )
+        claim = ClaimRecord(
+            claim_id=claim.claim_id,
+            session_id=claim.session_id,
+            operation=claim.operation,
+            scope=claim.scope,
+            affected_paths=claim.affected_paths,
+            acquired_at=claim.acquired_at,
+            last_heartbeat=claim.last_heartbeat,
+            tree_state=tree_state,
+        )
+        write_claim(claim_path, claim)
+
     return WorkClaimHandle(
         request_path=os.fspath(working_request),
         claim_path=os.fspath(claim_path),
         claim=claim,
+    )
+
+
+def capture_claim_tree_state(
+    repo_root: PathLike,
+    *,
+    claim_handle_or_path: Union[WorkClaimHandle, ClaimHandle, PathLike],
+    scope_paths: Iterable[PathLike],
+    expected_session_id: Optional[str] = None,
+) -> ClaimRecord:
+    if isinstance(claim_handle_or_path, WorkClaimHandle):
+        claim_path = claim_handle_or_path.claim_path
+        if expected_session_id is None:
+            expected_session_id = claim_handle_or_path.claim.session_id
+    elif isinstance(claim_handle_or_path, ClaimHandle):
+        claim_path = claim_handle_or_path.path
+        if expected_session_id is None:
+            expected_session_id = claim_handle_or_path.claim.session_id
+    else:
+        claim_path = os.fspath(claim_handle_or_path)
+
+    current = read_claim(claim_path)
+    if expected_session_id is not None and current.session_id != expected_session_id:
+        raise ForeignReleaseError(
+            f"refusing to update claim tree state on {claim_path!r}: held by session "
+            f"{current.session_id!r}, expected {expected_session_id!r}"
+        )
+
+    existing_tree_state = current.tree_state
+    if existing_tree_state is None:
+        raise TreeStateViolationError(
+            f"claim {claim_path!r} has no tree_state snapshot to update"
+        )
+
+    updated_tree_state = _build_claim_tree_state(
+        repo_root,
+        captured_at=existing_tree_state.captured_at,
+        preexisting_dirty_paths=existing_tree_state.preexisting_dirty_paths,
+        scope_paths=scope_paths,
+        head_sha=existing_tree_state.head_sha,
+    )
+    updated = ClaimRecord(
+        claim_id=current.claim_id,
+        session_id=current.session_id,
+        operation=current.operation,
+        scope=current.scope,
+        affected_paths=current.affected_paths,
+        acquired_at=current.acquired_at,
+        last_heartbeat=current.last_heartbeat,
+        tree_state=updated_tree_state,
+    )
+    write_claim(claim_path, updated)
+    if isinstance(claim_handle_or_path, WorkClaimHandle):
+        claim_handle_or_path.claim = updated
+    elif isinstance(claim_handle_or_path, ClaimHandle):
+        claim_handle_or_path.claim = updated
+    return updated
+
+
+def verify_and_stage_claim_scope(
+    repo_root: PathLike,
+    *,
+    claim_handle_or_path: Union[WorkClaimHandle, ClaimHandle, PathLike],
+    current_request_path: PathLike,
+    expected_session_id: Optional[str] = None,
+    now: Optional[datetime] = None,
+    stale_threshold: timedelta = timedelta(minutes=2),
+) -> ScopedStageResult:
+    if isinstance(claim_handle_or_path, WorkClaimHandle):
+        claim_path = claim_handle_or_path.claim_path
+        if expected_session_id is None:
+            expected_session_id = claim_handle_or_path.claim.session_id
+    elif isinstance(claim_handle_or_path, ClaimHandle):
+        claim_path = claim_handle_or_path.path
+        if expected_session_id is None:
+            expected_session_id = claim_handle_or_path.claim.session_id
+    else:
+        claim_path = os.fspath(claim_handle_or_path)
+
+    claim = read_claim(claim_path)
+    if expected_session_id is not None and claim.session_id != expected_session_id:
+        raise ForeignReleaseError(
+            f"refusing to verify commit scope for {claim_path!r}: held by session "
+            f"{claim.session_id!r}, expected {expected_session_id!r}"
+        )
+
+    tree_state = claim.tree_state
+    if tree_state is None:
+        raise TreeStateViolationError(
+            f"claim {claim_path!r} has no tree_state snapshot; cannot verify commit scope"
+        )
+
+    current_time = now or _utcnow()
+    claim_age = current_time - _parse_iso(claim.last_heartbeat)
+    if claim_age >= stale_threshold:
+        raise TreeStateViolationError(
+            f"refusing to commit {claim.claim_id}: claim heartbeat is stale\n"
+            f"  session:      {claim.session_id} (operation: {claim.operation})\n"
+            f"  last_heartbeat: {claim.last_heartbeat}\n"
+            "  remediation:  refresh or re-establish the claim, then re-snapshot the "
+            "tree before retrying the commit."
+        )
+
+    current_head = _git_head(repo_root)
+    if current_head != tree_state.head_sha:
+        raise TreeStateViolationError(
+            f"refusing to commit {claim.claim_id}: HEAD moved since claim time\n"
+            f"  session:      {claim.session_id} (operation: {claim.operation})\n"
+            f"  claimed_head: {tree_state.head_sha}\n"
+            f"  current_head: {current_head}\n"
+            "  remediation:  inspect what advanced HEAD, then re-claim or re-snapshot "
+            "before retrying."
+        )
+
+    request_path = _normalize_repo_relative_path(repo_root, current_request_path)
+    scope_paths = set(tree_state.scope_paths)
+    scope_paths.add(request_path)
+    structural_paths = {
+        _normalize_repo_relative_path(repo_root, claim_path),
+    }
+    if claim.affected_paths:
+        working_request_path = _normalize_repo_relative_path(
+            repo_root,
+            claim.affected_paths[0],
+        )
+        structural_paths.add(working_request_path)
+        working_request = Path(working_request_path)
+        if len(working_request.parts) >= 3 and working_request.parts[1] == "working":
+            queue_request = Path(working_request.parts[0]) / working_request.name
+            structural_paths.add(queue_request.as_posix())
+
+    allowed_dirty_paths = (
+        set(tree_state.preexisting_dirty_paths)
+        | scope_paths
+        | structural_paths
+    )
+    dirty_paths = set(_git_dirty_paths(repo_root))
+    staged_structural_paths: set[str] = set()
+    if claim.affected_paths:
+        working_request_path = _normalize_repo_relative_path(
+            repo_root,
+            claim.affected_paths[0],
+        )
+        working_request = Path(working_request_path)
+        if len(working_request.parts) >= 3 and working_request.parts[1] == "working":
+            queue_request = Path(working_request.parts[0]) / working_request.name
+            staged_structural_paths.add(queue_request.as_posix())
+
+    foreign_paths = tuple(sorted(dirty_paths - allowed_dirty_paths))
+    if foreign_paths:
+        foreign_display = ", ".join(foreign_paths)
+        raise TreeStateViolationError(
+            f"refusing to commit {claim.claim_id}: foreign changes detected outside "
+            "the claim snapshot\n"
+            f"  session:      {claim.session_id} (operation: {claim.operation})\n"
+            f"  foreign_paths:{foreign_display}\n"
+            "  remediation:  investigate what else is running and either stop it or "
+            "revert the foreign change before resuming."
+        )
+
+    staged_paths = tuple(sorted(scope_paths | staged_structural_paths))
+    if not staged_paths:
+        raise TreeStateViolationError(
+            f"refusing to commit {claim.claim_id}: the claim snapshot has no scoped paths"
+        )
+    _run_git(repo_root, "add", "--all", "--", *staged_paths)
+    return ScopedStageResult(
+        claim_id=claim.claim_id,
+        head_sha=current_head,
+        staged_paths=staged_paths,
     )
 
 
@@ -1833,17 +2292,21 @@ __all__ = [
     "ForeignReleaseError",
     "SessionFormatError",
     "RecoveryNotAllowedError",
+    "TreeStateViolationError",
     "AllocatedId",
     "LockInfo",
     "LockHandle",
     "ClaimHandle",
     "WorkClaimHandle",
+    "ClaimFileFingerprint",
+    "ClaimTreeState",
     "ClaimRecord",
     "SessionRecord",
     "WorkClaimRecoveryInspection",
     "RecoveredWorkClaim",
     "ParentArchivalResult",
     "RequestArchivalResult",
+    "ScopedStageResult",
     "validate_scope",
     "acquire_lock",
     "release_lock",
@@ -1860,6 +2323,8 @@ __all__ = [
     "release_claim",
     "refresh_claim_heartbeat",
     "claim_work_request",
+    "capture_claim_tree_state",
+    "verify_and_stage_claim_scope",
     "inspect_work_claim_recovery",
     "recover_orphaned_work_claim",
     "archive_user_request_if_complete",

@@ -2,6 +2,7 @@ import errno
 import json
 import multiprocessing
 import os
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -17,7 +18,9 @@ from lib.concurrency import (
     archive_legacy_context_if_complete,
     archive_user_request_if_complete,
     ClaimHandle,
+    ClaimTreeState,
     ClaimHeldError,
+    ClaimFileFingerprint,
     ClaimRecord,
     ClaimFormatError,
     CollisionError,
@@ -27,15 +30,18 @@ from lib.concurrency import (
     LockHeldError,
     LockInfo,
     RecoveryNotAllowedError,
+    ScopedStageResult,
     ScopeError,
     SessionFormatError,
     SessionRecord,
     StaleRenameError,
+    TreeStateViolationError,
     acquire_lock,
     allocate_req_file,
     allocate_ur_input,
     atomic_rename,
     atomic_write,
+    capture_claim_tree_state,
     claim_work_request,
     classify_lock,
     inspect_session_record,
@@ -49,6 +55,7 @@ from lib.concurrency import (
     refresh_heartbeat,
     release_lock,
     SessionClaimConflictError,
+    verify_and_stage_claim_scope,
     write_session_record,
     write_claim,
 )
@@ -121,6 +128,39 @@ class ConcurrencyPrimitivesTest(unittest.TestCase):
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)
         self.root = Path(self.tempdir.name)
+
+    def _init_git_repo(self) -> None:
+        subprocess.run(
+            ["git", "init"],
+            cwd=self.root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test User"],
+            cwd=self.root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=self.root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def _git(self, *args: str) -> str:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=self.root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return proc.stdout.strip()
 
     def _req_frontmatter(
         self,
@@ -933,6 +973,164 @@ class ConcurrencyPrimitivesTest(unittest.TestCase):
 
         self.assertFalse(claim_path.exists())
         self.assertTrue(queue_req.exists())
+
+    def test_claim_work_request_attaches_git_tree_state_snapshot(self) -> None:
+        self._init_git_repo()
+        (self.root / "do-work").mkdir(parents=True, exist_ok=True)
+        queue_req = self.root / "do-work" / "REQ-010-foreign-edit-detection.md"
+        queue_req.write_text("payload\n", encoding="utf-8")
+        self._git("add", "do-work/REQ-010-foreign-edit-detection.md")
+        self._git("commit", "-m", "baseline")
+        expected_head = self._git("rev-parse", "HEAD")
+
+        handle = claim_work_request(
+            self.root / "do-work",
+            request_path="REQ-010-foreign-edit-detection.md",
+            session_id="session-1",
+            operation="work",
+            repo_root=self.root,
+            now=datetime(2026, 4, 20, 21, 40, tzinfo=timezone.utc),
+        )
+
+        claim = read_claim(handle.claim_path)
+        assert claim.tree_state is not None
+        self.assertEqual(claim.tree_state.head_sha, expected_head)
+        self.assertEqual(claim.tree_state.preexisting_dirty_paths, ())
+        self.assertEqual(
+            claim.tree_state.scope_paths,
+            ("do-work/working/REQ-010-foreign-edit-detection.md",),
+        )
+        self.assertEqual(
+            [fingerprint.path for fingerprint in claim.tree_state.scope_fingerprints],
+            ["do-work/working/REQ-010-foreign-edit-detection.md"],
+        )
+
+    def test_claim_work_request_refuses_dirty_git_tree_by_default(self) -> None:
+        self._init_git_repo()
+        (self.root / "do-work").mkdir(parents=True, exist_ok=True)
+        queue_req = self.root / "do-work" / "REQ-010-foreign-edit-detection.md"
+        queue_req.write_text("payload\n", encoding="utf-8")
+        self._git("add", "do-work/REQ-010-foreign-edit-detection.md")
+        self._git("commit", "-m", "baseline")
+        (self.root / "foreign.txt").write_text("other work\n", encoding="utf-8")
+
+        with self.assertRaises(TreeStateViolationError) as ctx:
+            claim_work_request(
+                self.root / "do-work",
+                request_path="REQ-010-foreign-edit-detection.md",
+                session_id="session-1",
+                operation="work",
+                repo_root=self.root,
+            )
+
+        self.assertIn("git working tree is already dirty", str(ctx.exception))
+        self.assertIn("foreign.txt", str(ctx.exception))
+        self.assertTrue(queue_req.exists())
+
+    def test_verify_and_stage_claim_scope_rejects_foreign_edit_between_claim_and_commit(self) -> None:
+        self._init_git_repo()
+        (self.root / "do-work").mkdir(parents=True, exist_ok=True)
+        (self.root / "src").mkdir(parents=True, exist_ok=True)
+        queue_req = self.root / "do-work" / "REQ-010-foreign-edit-detection.md"
+        queue_req.write_text("payload\n", encoding="utf-8")
+        (self.root / "src" / "owned.py").write_text("print('owned')\n", encoding="utf-8")
+        (self.root / "src" / "foreign.py").write_text("print('foreign')\n", encoding="utf-8")
+        self._git("add", "do-work/REQ-010-foreign-edit-detection.md", "src/owned.py", "src/foreign.py")
+        self._git("commit", "-m", "baseline")
+
+        handle = claim_work_request(
+            self.root / "do-work",
+            request_path="REQ-010-foreign-edit-detection.md",
+            session_id="session-1",
+            operation="work",
+            repo_root=self.root,
+            now=datetime(2026, 4, 20, 21, 45, tzinfo=timezone.utc),
+        )
+
+        capture_claim_tree_state(
+            self.root,
+            claim_handle_or_path=handle,
+            scope_paths=(
+                "src/owned.py",
+                handle.request_path,
+            ),
+            expected_session_id="session-1",
+        )
+
+        (self.root / "src" / "owned.py").write_text("print('owned changed')\n", encoding="utf-8")
+        (self.root / "src" / "foreign.py").write_text("print('foreign changed')\n", encoding="utf-8")
+
+        with self.assertRaises(TreeStateViolationError) as ctx:
+            verify_and_stage_claim_scope(
+                self.root,
+                claim_handle_or_path=handle,
+                current_request_path=handle.request_path,
+                expected_session_id="session-1",
+                now=datetime(2026, 4, 20, 21, 46, tzinfo=timezone.utc),
+            )
+
+        message = str(ctx.exception)
+        self.assertIn("foreign changes detected", message)
+        self.assertIn("src/foreign.py", message)
+        self.assertIn("session-1", message)
+
+    def test_verify_and_stage_claim_scope_stages_only_snapshot_paths(self) -> None:
+        self._init_git_repo()
+        (self.root / "do-work").mkdir(parents=True, exist_ok=True)
+        (self.root / "do-work" / "archive").mkdir(parents=True, exist_ok=True)
+        (self.root / "src").mkdir(parents=True, exist_ok=True)
+        queue_req = self.root / "do-work" / "REQ-010-foreign-edit-detection.md"
+        queue_req.write_text("payload\n", encoding="utf-8")
+        (self.root / "src" / "owned.py").write_text("print('owned')\n", encoding="utf-8")
+        self._git("add", "do-work/REQ-010-foreign-edit-detection.md", "src/owned.py")
+        self._git("commit", "-m", "baseline")
+
+        handle = claim_work_request(
+            self.root / "do-work",
+            request_path="REQ-010-foreign-edit-detection.md",
+            session_id="session-1",
+            operation="work",
+            repo_root=self.root,
+            now=datetime(2026, 4, 20, 21, 50, tzinfo=timezone.utc),
+        )
+
+        capture_claim_tree_state(
+            self.root,
+            claim_handle_or_path=handle,
+            scope_paths=("src/owned.py",),
+            expected_session_id="session-1",
+        )
+
+        (self.root / "src" / "owned.py").write_text("print('owned changed')\n", encoding="utf-8")
+        archived_request = self.root / "do-work" / "archive" / "REQ-010-foreign-edit-detection.md"
+        (self.root / handle.request_path).rename(archived_request)
+        result = verify_and_stage_claim_scope(
+            self.root,
+            claim_handle_or_path=handle,
+            current_request_path=archived_request,
+            expected_session_id="session-1",
+            now=datetime(2026, 4, 20, 21, 51, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(
+            result.staged_paths,
+            (
+                "do-work/REQ-010-foreign-edit-detection.md",
+                "do-work/archive/REQ-010-foreign-edit-detection.md",
+                "src/owned.py",
+            ),
+        )
+        self.assertCountEqual(
+            self._git("diff", "--cached", "--name-only").splitlines(),
+            [
+                "do-work/archive/REQ-010-foreign-edit-detection.md",
+                "src/owned.py",
+            ],
+        )
+        self.assertNotIn(
+            " D do-work/REQ-010-foreign-edit-detection.md",
+            self._git("status", "--short"),
+        )
 
     def test_twenty_processes_race_for_one_lock(self) -> None:
         lock_path = str(self.root / "locks" / "race.lock")

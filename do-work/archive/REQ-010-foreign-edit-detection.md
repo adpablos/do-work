@@ -1,11 +1,14 @@
 ---
 id: REQ-010
 title: Foreign-edit detection at claim and commit
-status: pending
+status: completed
 created_at: 2026-04-17T23:50:00Z
 user_request: UR-001
 related: [REQ-001, REQ-002, REQ-004]
 batch: parallel-safety
+claimed_at: 2026-04-20T21:32:07Z
+route: C
+completed_at: 2026-04-20T21:42:50Z
 ---
 
 # Foreign-Edit Detection at Claim and Commit
@@ -94,3 +97,72 @@ See [user-requests/UR-001/input.md](./user-requests/UR-001/input.md) — "Commit
 | 8 | "At claim: snapshot the set of files the REQ intends to touch and the current HEAD. At commit: re-verify" (Resolved decision — Foreign-edit detection) | Detailed Requirements — Claim-time snapshot, Commit-time re-verification | Full |
 
 *Verified by verify-request action*
+
+## Triage
+
+**Route: C** - Complex
+
+**Reasoning:** This crosses the claim lifecycle, commit lifecycle, shared concurrency primitives, Git integration, tests, and the documented work-action contract. The change is localized to a few files, but the behavior spans multiple phases of the skill and has to fail loud instead of degrading silently.
+
+## Plan
+
+1. Extend the claim schema in `lib/concurrency.py` so a work claim can carry inspectable Git tree-state: claim-time `HEAD`, pre-existing dirty paths, and scoped file fingerprints attached to the `.claim.json` sidecar.
+2. Add REQ-010 helpers in `lib/concurrency.py` for two policy points used by `actions/work.md`: freeze the scoped commit snapshot once the implementation files are known, then re-verify/stage only that scope at commit time while rejecting foreign edits, stale claim heartbeats, and moved `HEAD`.
+3. Add isolated Git-backed tests in `lib/concurrency_test.py` for claim-time snapshotting, dirty-tree refusal, foreign-edit rejection between claim and commit, and scoped staging that proves `git add -A` is gone from the workflow contract.
+4. Rewrite `actions/work.md` so the work action is explicit about its tree-state assumption, when the scope snapshot is frozen, and how commit-time staging is performed without absorbing unrelated changes. Update `actions/concurrency-primitives.md` to reflect the extended claim schema and new helper surface.
+5. Finish the request log, bump `actions/version.md` to `0.19.0`, add the changelog entry, archive `REQ-010`, run the concurrency suite, and create one `[REQ-010] ...` commit.
+
+## Plan Verification
+
+**Source**: REQ-010 + UR-001 batch constraints (11 items enumerated)
+**Pre-fix coverage**: 100% (11/11 items addressed)
+**Post-fix coverage**: 100% (11/11 items addressed)
+
+### Coverage Map
+
+| # | Requirement / constraint | Plan step | Status |
+|---|--------------------------|-----------|--------|
+| 1 | Attach claim-time snapshot to the `.claim.json` sidecar | Step 1 | Full |
+| 2 | Capture claim-time `HEAD` | Step 1 | Full |
+| 3 | Re-verify at commit time before staging | Step 2 | Full |
+| 4 | Reject files outside the REQ scope | Step 2 | Full |
+| 5 | Replace `git add -A` with scoped staging | Step 2 + Step 4 | Full |
+| 6 | Fail loud with clear remediation and no auto-revert | Step 2 + Step 4 | Full |
+| 7 | Dirty-tree contract on claim must be explicit and refuse by default | Step 1 + Step 4 | Full |
+| 8 | Heartbeat-aware commit re-check | Step 2 | Full |
+| 9 | Document done-criterion #7 in `actions/work.md` | Step 4 | Full |
+| 10 | Add a regression test for foreign edits between claim and commit | Step 3 | Full |
+| 11 | Keep the change end-to-end: version, changelog, archive, single final commit | Step 5 | Full |
+
+### Fixes Applied
+
+- No plan gaps surfaced during verification; the initial plan already covered the code, tests, docs, and release hygiene required by REQ-010.
+
+*Verified during implementation*
+
+## Exploration
+
+No extra codebase exploration was needed beyond the existing concurrency surfaces. The affected behavior was already concentrated in `lib/concurrency.py`, `lib/concurrency_test.py`, `actions/work.md`, and the shared concurrency contract docs.
+
+## Implementation
+
+- Extended `ClaimRecord` with an inspectable `tree_state` payload and added explicit claim-snapshot dataclasses for scoped file fingerprints.
+- Updated `claim_work_request(...)` so Git-backed claims snapshot `HEAD` and refuse a dirty tree by default before the REQ is moved into `working/`.
+- Added `capture_claim_tree_state(...)` to freeze the scoped commit snapshot after planning, and `verify_and_stage_claim_scope(...)` to re-check heartbeat freshness, `HEAD`, and foreign dirty paths before staging only the approved scope.
+- Allowed the commit gate to ignore the workflow's own structural noise (`.claim.json`, queue→working rename lineage, archived REQ path) while still halting on truly foreign edits.
+- Expanded the isolated concurrency suite with Git-backed tests that cover claim snapshots, dirty-tree refusal, foreign-edit rejection, and scoped staging.
+- Rewrote the work-action contract to document the assumed tree state, the scope-freeze step, and the scoped commit gate that replaces `git add -A`.
+
+## Testing
+
+**Tests run:** `python3 -m unittest lib.concurrency_test -v`
+**Result:** ✓ All tests passing (47 tests)
+
+**Coverage added for REQ-010:**
+
+- Claim-time snapshot is attached to the sidecar with claim-time `HEAD`
+- Dirty tree at claim time fails loud and names the offending path
+- Foreign edit introduced between claim and commit aborts with a clear message
+- Scoped staging stages only the frozen snapshot paths instead of staging the whole tree
+
+*Verified by work action*

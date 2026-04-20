@@ -273,10 +273,11 @@ Work order — [REQ-NNN]:
 [ ] Step 4:   Plan → spawn Plan agent, append ## Plan section
 [ ] Step 4.5: *** MANDATORY *** Verify Plan → enumerate requirements, map to plan steps, fix gaps, append ## Plan Verification section
 [ ] Step 5:   Explore → spawn Explore agent OR append "Exploration: Not needed"
+[ ] Step 6:   Freeze claim scope snapshot → capture_claim_tree_state(...)
 [ ] Step 6:   Implement → spawn implementation agent, capture summary
 [ ] Step 6.5: Run tests → append ## Testing section
 [ ] Step 7:   Archive → update frontmatter, move file per UR/legacy logic
-[ ] Step 8:   Commit → git add -A && git commit (git repos only)
+[ ] Step 8:   Commit → verify_and_stage_claim_scope(...) && git commit (git repos only)
 [ ] Step 9:   Loop or exit
 ```
 
@@ -302,6 +303,8 @@ If no request files found, report completion and exit.
 
 **[Orchestrator action - do this yourself, BEFORE spawning any agents]**
 
+**Assumed working-tree state:** If this project is in Git, the work action assumes the tree is clean when the claim is taken. A dirty tree means another change is already in flight and this REQ cannot safely establish ownership of commit scope. In that case, fail loud and surface the dirty paths instead of guessing. The default policy is refuse-and-surface, not "warn and continue."
+
 1. Create `do-work/working/` folder if it doesn't exist
 2. Enforce **one work claim per session**:
    - Before claiming a new REQ, check `do-work/working/*.claim.json` for a claim already owned by the current `session_id`
@@ -316,6 +319,7 @@ claim = claim_work_request(
     request_path="REQ-XXX-slug.md",
     session_id="<current-session-id>",
     operation="work",
+    repo_root=".",
 )
 ```
 
@@ -324,6 +328,8 @@ This helper is the policy boundary for REQ-004:
 - On success, the queued REQ is immediately moved into `do-work/working/REQ-XXX-slug.md`
 - If the move fails, the helper removes the just-created claim before re-raising
 - If another session already won, the helper raises `ClaimHeldError` naming the winning session and heartbeat
+- In Git-backed projects, it snapshots claim-time tree state into the sidecar: current `HEAD`, any pre-existing dirty paths, and an initial scoped fingerprint for the claimed REQ file
+- In Git-backed projects, it refuses the claim if the tree is already dirty unless you intentionally opt into a different policy
 
 4. On successful claim, update the frontmatter in the moved REQ file:
 
@@ -344,7 +350,20 @@ claimed_at: 2025-01-26T10:30:00Z
   "scope": "req-claim:REQ-004",
   "affected_paths": ["do-work/working/REQ-004-atomic-req-claim.md"],
   "acquired_at": "2026-04-18T00:22:00Z",
-  "last_heartbeat": "2026-04-18T00:22:00Z"
+  "last_heartbeat": "2026-04-18T00:22:00Z",
+  "tree_state": {
+    "repo_root": "/repo",
+    "head_sha": "63477edd608c83afaddd6de04ae3f721c4f57954",
+    "captured_at": "2026-04-18T00:22:00Z",
+    "preexisting_dirty_paths": [],
+    "scope_paths": ["do-work/working/REQ-004-atomic-req-claim.md"],
+    "scope_fingerprints": [
+      {
+        "path": "do-work/working/REQ-004-atomic-req-claim.md",
+        "sha256": "..."
+      }
+    ]
+  }
 }
 ```
 
@@ -357,6 +376,24 @@ refresh_claim_heartbeat("do-work/working/REQ-XXX-slug.claim.json")
 ```
 
 Refresh before and after any operation that might block for a long time.
+
+8. Once planning/exploration have named the implementation files, freeze the scoped commit snapshot before code changes begin:
+
+```python
+from lib.concurrency import capture_claim_tree_state
+
+capture_claim_tree_state(
+    ".",
+    claim_handle_or_path=claim,
+    scope_paths=[
+        "src/feature.py",
+        "tests/test_feature.py",
+    ],
+    expected_session_id="<current-session-id>",
+)
+```
+
+This rewrites only the claim's `tree_state.scope_paths` and file fingerprints. The original claim-time `HEAD` and pre-existing dirty-state snapshot stay intact.
 
 7. If `ClaimHeldError` is raised:
    - Surface the error verbatim so the losing session can see who won
@@ -818,7 +855,7 @@ route: B
 mkdir -p do-work/archive
 ```
 
-**Claim release rule:** The `.claim.json` sidecar stays in place until the REQ has been transitioned out of `working/` or explicitly rolled back to the queue. Never drop the claim first and then attempt the move.
+**Claim release rule:** The `.claim.json` sidecar stays in place until the REQ has been transitioned out of `working/` **and** the commit-scope gate has finished. Never drop the claim first and then attempt the move. If archival succeeds but commit-time verification fails, keep the claim in place, surface the failure, and let the user resolve the tree state before retrying or rolling back.
 
 **REQ-002 note:** REQ-004 owns the queue → working transition. REQ-006 upgrades the archive step here to the same `atomic_rename(...)` discipline, with a short per-UR archival lock for the "last REQ finished" transition.
 
@@ -832,19 +869,19 @@ mkdir -p do-work/archive
    - If another session already finished that UR archival, the helper returns a clean `already-archived` outcome — no error, no second move attempt
    - If not all REQs are archived yet, the helper leaves the REQ in `do-work/archive/` root for now and returns `not-ready`
    - **Important:** "final REQ" means "final REQ already archived", not merely `status: completed` in `working/`. The last-one-standing decision happens after this REQ's own archive move
-   - Release the sidecar claim only after `archive_completed_request(...)` returns successfully
+   - Do **not** release the sidecar claim yet; Step 8 still needs the snapshot for commit-time re-verification
 
 **If REQ has `context_ref` (legacy system):**
    - Call the same `archive_completed_request(...)` helper
    - The helper moves the REQ into `do-work/archive/`, then takes a short `ur-archival:<context-id>` lock for the shared CONTEXT document
    - If all listed REQs are already archived, it atomically renames the CONTEXT file from `do-work/assets/` into `do-work/archive/`
    - If another session already moved that CONTEXT file, the helper returns `already-archived` cleanly
-   - Release the sidecar claim only after `archive_completed_request(...)` returns successfully
+   - Do **not** release the sidecar claim yet; Step 8 still needs the snapshot for commit-time re-verification
 
 **If REQ has neither `user_request` nor `context_ref` (standalone legacy):**
    - Call `archive_completed_request(...)`
    - The helper performs the single atomic rename from `do-work/working/REQ-XXX.md` to `do-work/archive/REQ-XXX.md`
-   - Release the sidecar claim only after the helper returns successfully
+   - Do **not** release the sidecar claim yet; Step 8 still needs the snapshot for commit-time re-verification
 
 **Complete request file structure after archival:**
 
@@ -992,12 +1029,39 @@ git rev-parse --git-dir 2>/dev/null
 
 If this fails (not a Git repo), skip this step entirely.
 
-**Stage and commit (single operation):**
-```bash
-# Stage ALL current changes - code, request file, assets
-git add -A
+**Re-verify and stage only the claimed scope:**
+```python
+from lib.concurrency import verify_and_stage_claim_scope
 
-# Single commit with structured message
+verify_and_stage_claim_scope(
+    ".",
+    claim_handle_or_path="do-work/working/REQ-XXX-slug.claim.json",
+    current_request_path="do-work/archive/REQ-XXX-slug.md",
+    expected_session_id="<current-session-id>",
+)
+```
+
+This is the REQ-010 gate:
+- It re-checks that the claim heartbeat is still fresh enough to trust
+- It re-checks that `HEAD` still matches the claim-time snapshot
+- It refuses the commit if any dirty path exists outside the frozen claim scope
+- It stages only the scoped files from the snapshot plus the REQ's current archived path
+- It never uses `git add -A` or `git add .`
+
+If `verify_and_stage_claim_scope(...)` raises, stop. Surface the message verbatim. Do **not** auto-revert or "clean up" foreign changes on the user's behalf.
+
+**After the commit succeeds, release the claim sidecar:**
+```python
+from lib.concurrency import release_claim
+
+release_claim(
+    "do-work/working/REQ-XXX-slug.claim.json",
+    expected_session_id="<current-session-id>",
+)
+```
+
+**Commit after scoped staging:**
+```bash
 git commit -m "$(cat <<'EOF'
 [REQ-003] Dark Mode (Route C)
 
@@ -1027,7 +1091,8 @@ If your platform standardizes co-author lines, use its preferred identity. For C
 
 **Important commit rules:**
 - **ONE commit per request** - do not analyze files individually or create multiple commits
-- **Stage everything** with `git add -A` - includes code changes, archived request file, and any assets
+- **Stage only the scoped snapshot** - code changes, tests, and the archived request file for this REQ
+- **Foreign changes halt the commit** - surface the named files and stop until the tree is clean again
 - **No pre-commit hook bypass** - if hooks fail, fix the issue and retry
 - **Failed requests get committed too** - the archived request with `status: failed` documents what was attempted
 
@@ -1067,17 +1132,20 @@ Use this checklist to ensure you don't skip critical steps:
 □ Step 4.5: Run verify-plan — enumerate, map, fix plan, store coverage
 □ Step 5: If plan indicates exploration needed: Spawn Explore agent, append ## Exploration section
 □ Step 5: If plan is fully specified: Append "Exploration: Not needed" section
+□ Step 6: Freeze the scoped commit snapshot with capture_claim_tree_state(...)
 □ Step 6: Spawn implementation agent
 □ Step 6: Refresh session + claim heartbeat around long-running operations
 □ Step 6.5: Run tests, append ## Testing section
 □ Step 7: Update frontmatter: status: completed, completed_at: <timestamp>
 □ Step 7: Append ## Implementation Summary section
-□ Step 7: Archive REQ with archive_completed_request(...), then release the matching .claim.json sidecar
+□ Step 7: Archive REQ with archive_completed_request(...); keep the .claim.json sidecar for Step 8
 □ Step 7: If user_request exists → helper takes per-UR lock, re-checks archived REQs, and either archives the UR or returns not-ready/already-archived
 □ Step 7: If context_ref exists → helper takes the shared-parent archival lock and either archives the CONTEXT file or returns not-ready/already-archived
 □ Step 7: If neither → helper performs the single working→archive atomic rename
 □ Abort path: If orchestration aborts before a terminal outcome, move REQ back to queue and release the claim
-□ Step 8: git add -A && git commit (if git repo)
+□ Step 8: verify_and_stage_claim_scope(...) stages only the frozen scope
+□ Step 8: git commit (if git repo)
+□ Step 8: release_claim(...) only after the commit succeeds
 □ Step 9: Check for more requests, loop or exit
 □ Step 9: If exiting: Run cleanup action (close completed URs, consolidate loose REQs)
 ```
@@ -1091,6 +1159,7 @@ Use this checklist to ensure you don't skip critical steps:
 - Skipping verify-plan (it's mandatory for all routes unless user said "skip verification")
 - Forgetting to check/archive related UR folders or legacy context documents
 - Archiving a UR folder before all its REQs are complete
+- Reaching for `git add -A` instead of re-verifying and staging the frozen claim scope
 
 ---
 

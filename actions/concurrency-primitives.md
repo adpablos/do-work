@@ -135,7 +135,20 @@ Cross-host cases (`info.hostname != local hostname`) always return `stale` — U
   "scope": "req-claim:REQ-002",
   "affected_paths": ["do-work/working/REQ-002-shared-concurrency-primitives.md"],
   "acquired_at": "2026-04-18T00:22:00Z",
-  "last_heartbeat": "2026-04-18T00:22:00Z"
+  "last_heartbeat": "2026-04-18T00:22:00Z",
+  "tree_state": {
+    "repo_root": "/repo",
+    "head_sha": "63477edd608c83afaddd6de04ae3f721c4f57954",
+    "captured_at": "2026-04-18T00:22:00Z",
+    "preexisting_dirty_paths": [],
+    "scope_paths": ["do-work/working/REQ-002-shared-concurrency-primitives.md"],
+    "scope_fingerprints": [
+      {
+        "path": "do-work/working/REQ-002-shared-concurrency-primitives.md",
+        "sha256": "..."
+      }
+    ]
+  }
 }
 ```
 
@@ -143,6 +156,8 @@ Cross-host cases (`info.hostname != local hostname`) always return `stale` — U
 
 - `write_claim(path, claim)` — backed by `atomic_write`.
 - `read_claim(path) -> ClaimRecord` — returns a dataclass; raises `ClaimFormatError` on schema mismatch or invalid JSON.
+- `capture_claim_tree_state(repo_root, *, claim_handle_or_path, scope_paths, expected_session_id=None)` — rewrites the scoped file snapshot while preserving claim-time `HEAD` and dirty-tree evidence.
+- `verify_and_stage_claim_scope(repo_root, *, claim_handle_or_path, current_request_path, expected_session_id=None, now=None, stale_threshold=timedelta(minutes=2))` — REQ-010's commit gate: re-verify `HEAD`, reject foreign dirty paths, and stage only the scoped snapshot.
 
 Claim lifecycle (when to create, refresh, release) is **not** defined here — that is per-action policy (REQ-004/REQ-007/REQ-009).
 
