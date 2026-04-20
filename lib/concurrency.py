@@ -490,6 +490,32 @@ class RecoveredWorkClaim:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class ParentArchivalResult:
+    kind: Literal["user-request", "legacy-context"]
+    identifier: str
+    outcome: Literal["not-ready", "archived", "already-archived"]
+    archive_path: str
+    missing_request_ids: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class RequestArchivalResult:
+    request_id: str
+    outcome: Literal["archived-root", "archived-parent"]
+    request_path: str
+    parent_result: Optional[ParentArchivalResult]
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        if self.parent_result is not None:
+            data["parent_result"] = self.parent_result.to_dict()
+        return data
+
+
 def atomic_write(path: PathLike, content: str, *, mode: str = "w") -> None:
     """Write content to path via write-to-temp-then-rename.
 
@@ -659,6 +685,130 @@ def _iter_work_claim_paths(do_work_root: PathLike) -> Iterable[Path]:
 def _session_record_path(do_work_root: PathLike, session_id: str) -> Path:
     root = _coerce_do_work_root(do_work_root)
     return root / ".sessions" / f"{session_id}.json"
+
+
+_FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n?", re.DOTALL)
+
+
+def _parse_frontmatter_value(raw: str) -> Any:
+    value = raw.strip()
+    if value == "":
+        return ""
+    if value.startswith("[") and value.endswith("]"):
+        inner = value[1:-1].strip()
+        if not inner:
+            return []
+        return [
+            item.strip().strip("'\"")
+            for item in inner.split(",")
+            if item.strip()
+        ]
+    if value.lower() == "null":
+        return None
+    if value.lower() == "true":
+        return True
+    if value.lower() == "false":
+        return False
+    return value.strip("'\"")
+
+
+def _read_frontmatter(path: PathLike) -> dict[str, Any]:
+    target = Path(os.fspath(path))
+    text = target.read_text(encoding="utf-8")
+    match = _FRONTMATTER_RE.match(text)
+    if match is None:
+        raise ConcurrencyError(
+            f"expected YAML frontmatter at {os.fspath(target)!r}"
+        )
+
+    frontmatter: dict[str, Any] = {}
+    for line in match.group(1).splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if ":" not in line:
+            continue
+        key, raw_value = line.split(":", 1)
+        frontmatter[key.strip()] = _parse_frontmatter_value(raw_value)
+    return frontmatter
+
+
+def _archival_lock_path(do_work_root: PathLike, identifier: str) -> Path:
+    root = _coerce_do_work_root(do_work_root)
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", identifier)
+    return root / ".locks" / f"ur-archival-{slug}.lock"
+
+
+def _acquire_archival_lock(
+    do_work_root: PathLike,
+    *,
+    identifier: str,
+    session_id: str,
+    operation: str,
+    now: Optional[datetime] = None,
+    timeout_seconds: float = 5.0,
+    retry_interval_seconds: float = 0.05,
+) -> LockHandle:
+    lock_path = _archival_lock_path(do_work_root, identifier)
+    deadline = time.monotonic() + timeout_seconds
+    scope = f"ur-archival:{identifier}"
+
+    while True:
+        try:
+            return acquire_lock(
+                lock_path,
+                session_id=session_id,
+                operation=operation,
+                scope=scope,
+                now=now,
+            )
+        except LockHeldError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(retry_interval_seconds)
+
+
+def _request_candidates(root: Path, *patterns: str) -> list[Path]:
+    candidates: list[Path] = []
+    for pattern in patterns:
+        candidates.extend(root.glob(pattern))
+    return sorted(candidates)
+
+
+def _find_unique_request_path(
+    root: Path,
+    req_id: str,
+    *,
+    patterns: tuple[str, ...],
+    label: str,
+) -> Optional[Path]:
+    matches = _request_candidates(root, *[pattern.format(req_id=req_id) for pattern in patterns])
+    if len(matches) > 1:
+        raise ConcurrencyError(
+            f"refusing to continue: {req_id} appears multiple times in {label}: "
+            f"{', '.join(os.fspath(path) for path in matches)}"
+        )
+    return matches[0] if matches else None
+
+
+def _parse_ur_requests(input_path: Path) -> tuple[str, ...]:
+    frontmatter = _read_frontmatter(input_path)
+    raw_requests = frontmatter.get("requests")
+    if not isinstance(raw_requests, list):
+        raise ConcurrencyError(
+            f"expected requests array in {os.fspath(input_path)!r}"
+        )
+    requests = tuple(str(item) for item in raw_requests)
+    if not requests:
+        raise ConcurrencyError(
+            f"expected at least one REQ in {os.fspath(input_path)!r}"
+        )
+    return requests
+
+
+def _resolve_context_path(do_work_root: PathLike, context_ref: str) -> Path:
+    root = _coerce_do_work_root(do_work_root)
+    return _work_request_path(root, context_ref)
 
 
 def _recovery_log_path(
@@ -1274,6 +1424,292 @@ def recover_orphaned_work_claim(
     )
 
 
+def archive_user_request_if_complete(
+    do_work_root: PathLike,
+    *,
+    ur_id: str,
+    session_id: str,
+    operation: str = "work",
+    now: Optional[datetime] = None,
+) -> ParentArchivalResult:
+    root = _coerce_do_work_root(do_work_root)
+    open_ur_dir = root / "user-requests" / ur_id
+    archive_ur_dir = root / "archive" / ur_id
+    handle = _acquire_archival_lock(
+        root,
+        identifier=ur_id,
+        session_id=session_id,
+        operation=operation,
+        now=now,
+    )
+    try:
+        if archive_ur_dir.exists():
+            if open_ur_dir.exists():
+                raise ConcurrencyError(
+                    f"refusing to archive {ur_id}: both {os.fspath(open_ur_dir)!r} "
+                    f"and {os.fspath(archive_ur_dir)!r} exist"
+                )
+            return ParentArchivalResult(
+                kind="user-request",
+                identifier=ur_id,
+                outcome="already-archived",
+                archive_path=os.fspath(archive_ur_dir),
+                missing_request_ids=(),
+            )
+
+        if not open_ur_dir.exists():
+            raise ConcurrencyError(
+                f"refusing to archive {ur_id}: expected open folder "
+                f"{os.fspath(open_ur_dir)!r} but it does not exist"
+            )
+
+        request_ids = _parse_ur_requests(open_ur_dir / "input.md")
+        loose_paths: list[Path] = []
+        missing_ids: list[str] = []
+
+        for req_id in request_ids:
+            in_open_ur = _find_unique_request_path(
+                root,
+                req_id,
+                patterns=(f"user-requests/{ur_id}/{{req_id}}-*.md",),
+                label=f"user-requests/{ur_id}",
+            )
+            in_archive_root = _find_unique_request_path(
+                root,
+                req_id,
+                patterns=("archive/{req_id}-*.md",),
+                label="archive root",
+            )
+            in_archive_ur = _find_unique_request_path(
+                root,
+                req_id,
+                patterns=(f"archive/{ur_id}/{{req_id}}-*.md",),
+                label=f"archive/{ur_id}",
+            )
+            found = [path for path in (in_open_ur, in_archive_root, in_archive_ur) if path is not None]
+            if len(found) > 1:
+                raise ConcurrencyError(
+                    f"refusing to archive {ur_id}: {req_id} exists in multiple archival "
+                    f"locations: {', '.join(os.fspath(path) for path in found)}"
+                )
+            if not found:
+                missing_ids.append(req_id)
+                continue
+            if in_archive_root is not None:
+                loose_paths.append(in_archive_root)
+
+        if missing_ids:
+            return ParentArchivalResult(
+                kind="user-request",
+                identifier=ur_id,
+                outcome="not-ready",
+                archive_path=os.fspath(archive_ur_dir),
+                missing_request_ids=tuple(missing_ids),
+            )
+
+        for loose_path in loose_paths:
+            target = open_ur_dir / loose_path.name
+            if target.exists():
+                raise ConcurrencyError(
+                    f"refusing to archive {ur_id}: destination {os.fspath(target)!r} "
+                    "already exists before moving loose archived REQs"
+                )
+
+        for loose_path in loose_paths:
+            atomic_rename(
+                loose_path,
+                open_ur_dir / loose_path.name,
+                transition=f"archive-root->open-ur for {loose_path.stem}",
+            )
+
+        atomic_rename(
+            open_ur_dir,
+            archive_ur_dir,
+            transition=f"user-request archive for {ur_id}",
+        )
+        return ParentArchivalResult(
+            kind="user-request",
+            identifier=ur_id,
+            outcome="archived",
+            archive_path=os.fspath(archive_ur_dir),
+            missing_request_ids=(),
+        )
+    finally:
+        release_lock(handle)
+
+
+def archive_legacy_context_if_complete(
+    do_work_root: PathLike,
+    *,
+    context_ref: str,
+    session_id: str,
+    operation: str = "work",
+    now: Optional[datetime] = None,
+) -> ParentArchivalResult:
+    root = _coerce_do_work_root(do_work_root)
+    open_context = _resolve_context_path(root, context_ref)
+    archive_context = root / "archive" / open_context.name
+    identifier = open_context.stem
+    handle = _acquire_archival_lock(
+        root,
+        identifier=identifier,
+        session_id=session_id,
+        operation=operation,
+        now=now,
+    )
+    try:
+        if archive_context.exists():
+            if open_context.exists():
+                raise ConcurrencyError(
+                    f"refusing to archive {identifier}: both {os.fspath(open_context)!r} "
+                    f"and {os.fspath(archive_context)!r} exist"
+                )
+            return ParentArchivalResult(
+                kind="legacy-context",
+                identifier=identifier,
+                outcome="already-archived",
+                archive_path=os.fspath(archive_context),
+                missing_request_ids=(),
+            )
+        if not open_context.exists():
+            raise ConcurrencyError(
+                f"refusing to archive {identifier}: expected context file "
+                f"{os.fspath(open_context)!r} but it does not exist"
+            )
+
+        frontmatter = _read_frontmatter(open_context)
+        raw_requests = frontmatter.get("requests")
+        if not isinstance(raw_requests, list):
+            raise ConcurrencyError(
+                f"expected requests array in {os.fspath(open_context)!r}"
+            )
+
+        missing_ids: list[str] = []
+        for req_id in (str(item) for item in raw_requests):
+            archived_path = _find_unique_request_path(
+                root,
+                req_id,
+                patterns=(
+                    "archive/{req_id}-*.md",
+                    "archive/UR-*/{req_id}-*.md",
+                ),
+                label="archive",
+            )
+            if archived_path is None:
+                missing_ids.append(req_id)
+
+        if missing_ids:
+            return ParentArchivalResult(
+                kind="legacy-context",
+                identifier=identifier,
+                outcome="not-ready",
+                archive_path=os.fspath(archive_context),
+                missing_request_ids=tuple(missing_ids),
+            )
+
+        atomic_rename(
+            open_context,
+            archive_context,
+            transition=f"legacy-context archive for {identifier}",
+        )
+        return ParentArchivalResult(
+            kind="legacy-context",
+            identifier=identifier,
+            outcome="archived",
+            archive_path=os.fspath(archive_context),
+            missing_request_ids=(),
+        )
+    finally:
+        release_lock(handle)
+
+
+def archive_completed_request(
+    do_work_root: PathLike,
+    *,
+    working_request_path: PathLike,
+    session_id: str,
+    operation: str = "work",
+    now: Optional[datetime] = None,
+) -> RequestArchivalResult:
+    root = _coerce_do_work_root(do_work_root)
+    working_request = _work_request_path(root, working_request_path)
+    expected_parent = root / "working"
+    if working_request.parent != expected_parent:
+        raise ConcurrencyError(
+            f"completed request archival expects a file in {os.fspath(expected_parent)!r}, "
+            f"got {os.fspath(working_request)!r}"
+        )
+
+    if not working_request.exists():
+        raise ConcurrencyError(
+            f"completed request archival expected {os.fspath(working_request)!r} to exist"
+        )
+
+    frontmatter = _read_frontmatter(working_request)
+    request_id = _req_identifier_from_path(working_request)
+    archive_dir = root / "archive"
+    os.makedirs(archive_dir, exist_ok=True)
+
+    user_request = frontmatter.get("user_request")
+    if isinstance(user_request, str) and user_request:
+        open_ur_dir = root / "user-requests" / user_request
+        archive_ur_dir = archive_dir / user_request
+        if archive_ur_dir.exists() and not open_ur_dir.exists():
+            raise ConcurrencyError(
+                f"refusing to archive {request_id}: {user_request} is already archived "
+                f"at {os.fspath(archive_ur_dir)!r} while {os.fspath(working_request)!r} "
+                "is still in working/"
+            )
+        if not open_ur_dir.exists():
+            raise ConcurrencyError(
+                f"refusing to archive {request_id}: user_request folder "
+                f"{os.fspath(open_ur_dir)!r} is missing"
+            )
+
+    request_archive_path = archive_dir / working_request.name
+    atomic_rename(
+        working_request,
+        request_archive_path,
+        transition=f"working->archive for {request_id}",
+    )
+
+    parent_result: Optional[ParentArchivalResult] = None
+    if isinstance(user_request, str) and user_request:
+        parent_result = archive_user_request_if_complete(
+            root,
+            ur_id=user_request,
+            session_id=session_id,
+            operation=operation,
+            now=now,
+        )
+        if parent_result.outcome in {"archived", "already-archived"}:
+            final_request_path = archive_dir / user_request / working_request.name
+            if final_request_path.exists():
+                return RequestArchivalResult(
+                    request_id=request_id,
+                    outcome="archived-parent",
+                    request_path=os.fspath(final_request_path),
+                    parent_result=parent_result,
+                )
+
+    context_ref = frontmatter.get("context_ref")
+    if isinstance(context_ref, str) and context_ref:
+        parent_result = archive_legacy_context_if_complete(
+            root,
+            context_ref=context_ref,
+            session_id=session_id,
+            operation=operation,
+            now=now,
+        )
+
+    return RequestArchivalResult(
+        request_id=request_id,
+        outcome="archived-root",
+        request_path=os.fspath(request_archive_path),
+        parent_result=parent_result,
+    )
+
+
 def allocate_ur_input(
     do_work_root: PathLike,
     *,
@@ -1406,6 +1842,8 @@ __all__ = [
     "SessionRecord",
     "WorkClaimRecoveryInspection",
     "RecoveredWorkClaim",
+    "ParentArchivalResult",
+    "RequestArchivalResult",
     "validate_scope",
     "acquire_lock",
     "release_lock",
@@ -1424,6 +1862,9 @@ __all__ = [
     "claim_work_request",
     "inspect_work_claim_recovery",
     "recover_orphaned_work_claim",
+    "archive_user_request_if_complete",
+    "archive_legacy_context_if_complete",
+    "archive_completed_request",
     "allocate_ur_input",
     "allocate_req_file",
 ]

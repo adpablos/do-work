@@ -820,35 +820,31 @@ mkdir -p do-work/archive
 
 **Claim release rule:** The `.claim.json` sidecar stays in place until the REQ has been transitioned out of `working/` or explicitly rolled back to the queue. Never drop the claim first and then attempt the move.
 
-**REQ-002 note:** REQ-004 owns the queue → working transition. REQ-006 later upgrades the archive moves in this step to the same `atomic_rename(...)` discipline for UR archival.
+**REQ-002 note:** REQ-004 owns the queue → working transition. REQ-006 upgrades the archive step here to the same `atomic_rename(...)` discipline, with a short per-UR archival lock for the "last REQ finished" transition.
 
 4. **Archive the request file** — behavior depends on whether the REQ has a UR:
 
 **If REQ has `user_request: UR-NNN` (new system):**
-   - Read the UR's `input.md` from `do-work/user-requests/UR-NNN/`
-   - Check its `requests` array (e.g., `[REQ-018, REQ-019, REQ-020]`)
-   - Check if ALL listed REQs are now completed (in `do-work/working/` with `status: completed` or already in `archive/`)
-   - If **all REQs complete**:
-     - Move the completed REQ file into the UR folder: `mv do-work/working/REQ-XXX.md do-work/user-requests/UR-NNN/`
-     - Move any other completed REQs from `do-work/archive/` that belong to this UR into the UR folder
-     - Move the entire UR folder to archive: `mv do-work/user-requests/UR-NNN do-work/archive/`
-     - Release the sidecar claim: `release_claim("do-work/working/REQ-XXX-slug.claim.json", expected_session_id="<current-session-id>")`
-   - If **not all REQs complete**:
-     - Move the REQ file directly to archive for now: `mv do-work/working/REQ-XXX.md do-work/archive/`
-     - The UR folder stays in `user-requests/` until the last REQ completes, which triggers the full UR archive
-     - Release the sidecar claim: `release_claim("do-work/working/REQ-XXX-slug.claim.json", expected_session_id="<current-session-id>")`
+   - Call `archive_completed_request(do_work_root, working_request_path=..., session_id="<current-session-id>", operation="work")`
+   - That helper first atomically moves the REQ out of `working/` into `do-work/archive/`
+   - Then it takes a short per-UR lock (`ur-archival:UR-NNN`), re-reads the UR's `requests` array, and checks whether every listed REQ is already archived
+   - If **all REQs are already archived**, it gathers any loose `archive/REQ-*.md` files for that UR into the open UR folder and atomically renames `do-work/user-requests/UR-NNN/` to `do-work/archive/UR-NNN/`
+   - If another session already finished that UR archival, the helper returns a clean `already-archived` outcome — no error, no second move attempt
+   - If not all REQs are archived yet, the helper leaves the REQ in `do-work/archive/` root for now and returns `not-ready`
+   - **Important:** "final REQ" means "final REQ already archived", not merely `status: completed` in `working/`. The last-one-standing decision happens after this REQ's own archive move
+   - Release the sidecar claim only after `archive_completed_request(...)` returns successfully
 
 **If REQ has `context_ref` (legacy system):**
-   - Move REQ to archive: `mv do-work/working/REQ-XXX.md do-work/archive/`
-   - Read the CONTEXT document from `do-work/assets/`
-   - Check its `requests` array
-   - If ALL listed REQs are now in `do-work/archive/`: move the CONTEXT doc to archive too
-   - If not: leave CONTEXT doc in `assets/`
-   - Release the sidecar claim: `release_claim("do-work/working/REQ-XXX-slug.claim.json", expected_session_id="<current-session-id>")`
+   - Call the same `archive_completed_request(...)` helper
+   - The helper moves the REQ into `do-work/archive/`, then takes a short `ur-archival:<context-id>` lock for the shared CONTEXT document
+   - If all listed REQs are already archived, it atomically renames the CONTEXT file from `do-work/assets/` into `do-work/archive/`
+   - If another session already moved that CONTEXT file, the helper returns `already-archived` cleanly
+   - Release the sidecar claim only after `archive_completed_request(...)` returns successfully
 
 **If REQ has neither `user_request` nor `context_ref` (standalone legacy):**
-   - Move directly to archive: `mv do-work/working/REQ-XXX.md do-work/archive/`
-   - Release the sidecar claim: `release_claim("do-work/working/REQ-XXX-slug.claim.json", expected_session_id="<current-session-id>")`
+   - Call `archive_completed_request(...)`
+   - The helper performs the single atomic rename from `do-work/working/REQ-XXX.md` to `do-work/archive/REQ-XXX.md`
+   - Release the sidecar claim only after the helper returns successfully
 
 **Complete request file structure after archival:**
 
@@ -1050,7 +1046,7 @@ After archiving and committing:
 2. If found: Report what was completed, then start Step 1 again
 3. If empty: **Run the cleanup action** (see [cleanup action](./cleanup.md)), then report final summary and exit
 
-The cleanup action consolidates the archive — closing any UR folders where all REQs are now complete, moving loose REQ files into their UR folders, and organizing legacy files. This catches any consolidation that was missed during individual request archival.
+The cleanup action consolidates the archive and organizes legacy files. REQ-006 keeps the work action on a short per-UR archival lock instead of sharing cleanup's global lock; REQ-009 therefore needs cleanup to re-scan between structural moves rather than assume its initial directory view stays fresh.
 
 This fresh check on each loop means newly added requests get picked up automatically.
 
@@ -1076,10 +1072,10 @@ Use this checklist to ensure you don't skip critical steps:
 □ Step 6.5: Run tests, append ## Testing section
 □ Step 7: Update frontmatter: status: completed, completed_at: <timestamp>
 □ Step 7: Append ## Implementation Summary section
-□ Step 7: Archive REQ (see UR vs legacy archival logic), then release the matching .claim.json sidecar
-□ Step 7: If user_request exists → check if all UR's REQs complete → move UR folder to archive/
-□ Step 7: If context_ref exists (legacy) → check if all related REQs archived → move CONTEXT to archive/
-□ Step 7: If neither → mv do-work/working/REQ-XXX.md do-work/archive/
+□ Step 7: Archive REQ with archive_completed_request(...), then release the matching .claim.json sidecar
+□ Step 7: If user_request exists → helper takes per-UR lock, re-checks archived REQs, and either archives the UR or returns not-ready/already-archived
+□ Step 7: If context_ref exists → helper takes the shared-parent archival lock and either archives the CONTEXT file or returns not-ready/already-archived
+□ Step 7: If neither → helper performs the single working→archive atomic rename
 □ Abort path: If orchestration aborts before a terminal outcome, move REQ back to queue and release the claim
 □ Step 8: git add -A && git commit (if git repo)
 □ Step 9: Check for more requests, loop or exit

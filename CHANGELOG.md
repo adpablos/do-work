@@ -4,6 +4,16 @@ What's new, what's better, what's different. Most recent stuff on top.
 
 ---
 
+## 0.18.0 — The Archive Handshake (2026-04-20)
+
+The last-REQ archive move stops freelancing now. Work archives the finished REQ first, then takes a short per-UR lock to decide whether the parent UR or shared legacy CONTEXT can move, so concurrent finishers stop tripping over the same folder.
+
+- Added archival helpers to `lib/concurrency.py` for completed REQs, final UR moves, and shared legacy CONTEXT moves
+- Added archival regression tests, including a parallel UR race that proves one winner and clean `already-archived` losers
+- Rewrote the work/cleanup docs to use the helper flow and locked in the REQ-006 vs REQ-009 coordination choice: per-UR lock for work, re-scan under cleanup's global lock later
+- Archived `REQ-006` as completed
+- Bumped the public skill version to `0.18.0`
+
 ## 0.17.0 — The Rescue Rope (2026-04-20)
 
 Stranded work no longer gets guessed back into the queue. `do work resume` now has a real recovery path: it only frees a REQ when the claim heartbeat is stale, the owning session is stale too, and the original PID is gone on this host. Everything else stays loud and visible instead of being "helpfully" stolen.

@@ -171,7 +171,24 @@ Claim lifecycle (when to create, refresh, release) is **not** defined here — t
 
 `recover_orphaned_work_claim(...)` is intentionally narrow: it moves the REQ from `working/` back to the queue, writes a JSON log entry into `do-work/.recovery-log/`, removes the `.claim.json` sidecar, and deletes the originating session record. It raises `RecoveryNotAllowedError` if the evidence is anything other than `recoverable`.
 
-### 7. Standard Lock Scopes
+### 7. Archival Helpers
+
+**Contract:** Work and cleanup do not hand-roll the "is this the last REQ?" scan. They call the archival helpers, which take a short `ur-archival:<identifier>` lock, re-scan authoritative archive locations, and either perform the atomic parent move or return a clean "not ready / already archived" result.
+
+**API:**
+
+- `archive_completed_request(do_work_root, *, working_request_path, session_id, operation="work", now=None) -> RequestArchivalResult`
+- `archive_user_request_if_complete(do_work_root, *, ur_id, session_id, operation="work", now=None) -> ParentArchivalResult`
+- `archive_legacy_context_if_complete(do_work_root, *, context_ref, session_id, operation="work", now=None) -> ParentArchivalResult`
+
+**Behavior notes:**
+
+- `archive_completed_request(...)` always archives the REQ out of `working/` first. The "last one standing" decision happens only after that REQ is already in `do-work/archive/`.
+- `archive_user_request_if_complete(...)` counts only already-archived REQs (`archive/` root or `archive/UR-NNN/`), never `status: completed` files still sitting in `working/`.
+- A second caller racing the same UR or CONTEXT path does not raise on the happy path. It retries briefly, then sees `already-archived` once the winner finishes.
+- Cleanup may call the same helpers with `operation="cleanup"` while holding its own short global lock; REQ-006 intentionally chose per-UR archival locks plus cleanup re-scan rather than making work wait on `cleanup-global`.
+
+### 8. Standard Lock Scopes
 
 **Canonical catalog.** Scope names are canonical and typed. Ad-hoc scope strings are rejected by `acquire_lock` via `ScopeError`. New scopes must be added to this document **and** to `SCOPES` in `lib/concurrency.py` before they can be used in action code.
 
@@ -187,7 +204,7 @@ Claim lifecycle (when to create, refresh, release) is **not** defined here — t
 
 Parameterized scopes (those with `:<...>`) accept any suffix; the library validates the scope **prefix** against the canonical list.
 
-### 8. Deterministic Failure Messages
+### 9. Deterministic Failure Messages
 
 Every lock-acquisition failure carries:
 

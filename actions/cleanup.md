@@ -13,7 +13,7 @@ The archive should be a collection of self-contained UR folders, each containing
 
 Before Pass 1, establish session identity per [actions/session-identity.md](./session-identity.md). Cleanup performs multiple folder moves; every one of those is a coordinated write and must not happen without a session record. If cleanup runs automatically at the end of a work loop, session identity was already established at work's Step 0 — refresh the heartbeat and proceed. If cleanup is invoked standalone (`do work cleanup`), establish a fresh session record before Pass 1.
 
-Shared coordination primitives are defined in [actions/concurrency-primitives.md](./concurrency-primitives.md) and implemented in `lib/concurrency.py`. Cleanup still documents raw moves here because REQ-009 has not wired them yet, but the eventual implementation should use the shared lock and atomic-rename helpers instead of ad-hoc filesystem operations.
+Shared coordination primitives are defined in [actions/concurrency-primitives.md](./concurrency-primitives.md) and implemented in `lib/concurrency.py`. REQ-006 chose **option (b)** for coordination with cleanup: work uses a short per-UR archival lock, while cleanup keeps its own short global lock and re-scans between structural moves instead of assuming the initial scan stays valid. Cleanup still documents raw moves here because REQ-009 has not wired the global lock yet, but the eventual implementation should use the shared helpers instead of ad-hoc filesystem operations.
 
 Then three passes, in order:
 
@@ -24,14 +24,13 @@ Check `do-work/user-requests/` for UR folders that are ready to archive.
 For each UR folder in `do-work/user-requests/`:
 
 1. Read `input.md` and parse the `requests` array from frontmatter (e.g., `[REQ-044, REQ-045, REQ-046]`)
-2. For each REQ ID in the array, check if it exists with `status: completed` in ANY of these locations:
+2. For each REQ ID in the array, check if it is already archived in ANY of these locations:
    - `do-work/archive/UR-NNN/` (already consolidated)
    - `do-work/archive/` root (loose in archive)
-   - `do-work/working/` (just completed, not yet moved)
 3. If **ALL** REQs are completed:
+   - Re-scan the same UR immediately before moving anything; cleanup must tolerate work archiving the UR between scans
    - Gather any loose completed REQ files from `do-work/archive/` root into the UR folder
-   - Gather any completed REQ files from `do-work/working/` into the UR folder
-   - Move the entire UR folder to `do-work/archive/UR-NNN/`
+   - Move the entire UR folder to `do-work/archive/UR-NNN/` (eventual implementation: `archive_user_request_if_complete(..., operation="cleanup")`)
    - Report: `Archived UR-NNN (all N REQs complete)`
 4. If **NOT all** REQs are completed:
    - Leave the UR folder in `user-requests/` — it's not ready yet

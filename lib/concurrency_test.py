@@ -7,10 +7,15 @@ import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 from unittest import mock
 
 from lib.concurrency import (
     AtomicWriteError,
+    ConcurrencyError,
+    archive_completed_request,
+    archive_legacy_context_if_complete,
+    archive_user_request_if_complete,
     ClaimHandle,
     ClaimHeldError,
     ClaimRecord,
@@ -89,11 +94,85 @@ def _work_claim_race_worker(
     result_queue.put(("acquired", session_id, handle.claim_path))
 
 
+def _ur_archival_race_worker(
+    do_work_root: str,
+    ur_id: str,
+    start_event,
+    result_queue,
+) -> None:
+    start_event.wait()
+    session_id = f"session-{os.getpid()}"
+    try:
+        result = archive_user_request_if_complete(
+            do_work_root,
+            ur_id=ur_id,
+            session_id=session_id,
+            operation="work",
+        )
+    except Exception as exc:
+        result_queue.put(("error", session_id, type(exc).__name__, str(exc)))
+        return
+
+    result_queue.put(("ok", session_id, result.outcome, result.archive_path))
+
+
 class ConcurrencyPrimitivesTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)
         self.root = Path(self.tempdir.name)
+
+    def _req_frontmatter(
+        self,
+        req_id: str,
+        *,
+        title: str = "Example request",
+        status: str = "completed",
+        user_request: Optional[str] = None,
+        context_ref: Optional[str] = None,
+    ) -> str:
+        lines = [
+            "---",
+            f"id: {req_id}",
+            f"title: {title}",
+            f"status: {status}",
+            "created_at: 2026-04-18T00:00:00Z",
+        ]
+        if user_request is not None:
+            lines.append(f"user_request: {user_request}")
+        if context_ref is not None:
+            lines.append(f"context_ref: {context_ref}")
+        lines.extend(["---", "", f"# {title}", ""])
+        return "\n".join(lines)
+
+    def _ur_input(self, ur_id: str, requests: list[str]) -> str:
+        return "\n".join(
+            [
+                "---",
+                f"id: {ur_id}",
+                "title: Batch",
+                "created_at: 2026-04-18T00:00:00Z",
+                f"requests: [{', '.join(requests)}]",
+                "---",
+                "",
+                "# Batch",
+                "",
+            ]
+        )
+
+    def _context_input(self, requests: list[str]) -> str:
+        return "\n".join(
+            [
+                "---",
+                "id: CONTEXT-001",
+                "title: Legacy batch",
+                f"requests: [{', '.join(requests)}]",
+                "---",
+                "",
+                "# Legacy batch",
+                "",
+            ]
+        )
 
     def test_acquire_release_and_inspect_lock(self) -> None:
         path = self.root / "locks" / "cleanup.lock"
@@ -923,6 +1002,214 @@ class ConcurrencyPrimitivesTest(unittest.TestCase):
         self.assertFalse(queue_req.exists())
         self.assertTrue((self.root / "working" / "REQ-004-atomic-req-claim.md").exists())
         self.assertTrue((self.root / "working" / "REQ-004-atomic-req-claim.claim.json").exists())
+
+    def test_archive_completed_request_closes_ur_when_last_req_finishes(self) -> None:
+        working_dir = self.root / "working"
+        archive_dir = self.root / "archive"
+        ur_dir = self.root / "user-requests" / "UR-001"
+        working_dir.mkdir(parents=True, exist_ok=True)
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        ur_dir.mkdir(parents=True, exist_ok=True)
+
+        (ur_dir / "input.md").write_text(
+            self._ur_input("UR-001", ["REQ-006", "REQ-007"]),
+            encoding="utf-8",
+        )
+        (archive_dir / "REQ-007-peer.md").write_text(
+            self._req_frontmatter("REQ-007", user_request="UR-001"),
+            encoding="utf-8",
+        )
+        working_req = working_dir / "REQ-006-atomic-ur-archival.md"
+        working_req.write_text(
+            self._req_frontmatter("REQ-006", user_request="UR-001"),
+            encoding="utf-8",
+        )
+
+        result = archive_completed_request(
+            self.root,
+            working_request_path=working_req,
+            session_id="session-1",
+        )
+
+        self.assertEqual(result.outcome, "archived-parent")
+        self.assertFalse(working_req.exists())
+        self.assertFalse((archive_dir / "REQ-007-peer.md").exists())
+        self.assertFalse(ur_dir.exists())
+        self.assertTrue((archive_dir / "UR-001" / "input.md").exists())
+        self.assertTrue((archive_dir / "UR-001" / "REQ-006-atomic-ur-archival.md").exists())
+        self.assertTrue((archive_dir / "UR-001" / "REQ-007-peer.md").exists())
+        assert result.parent_result is not None
+        self.assertEqual(result.parent_result.outcome, "archived")
+
+    def test_archive_completed_request_leaves_ur_open_when_other_reqs_are_not_archived(self) -> None:
+        working_dir = self.root / "working"
+        archive_dir = self.root / "archive"
+        ur_dir = self.root / "user-requests" / "UR-001"
+        working_dir.mkdir(parents=True, exist_ok=True)
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        ur_dir.mkdir(parents=True, exist_ok=True)
+
+        (ur_dir / "input.md").write_text(
+            self._ur_input("UR-001", ["REQ-006", "REQ-007"]),
+            encoding="utf-8",
+        )
+        working_req = working_dir / "REQ-006-atomic-ur-archival.md"
+        working_req.write_text(
+            self._req_frontmatter("REQ-006", user_request="UR-001"),
+            encoding="utf-8",
+        )
+
+        result = archive_completed_request(
+            self.root,
+            working_request_path=working_req,
+            session_id="session-1",
+        )
+
+        self.assertEqual(result.outcome, "archived-root")
+        self.assertTrue((archive_dir / "REQ-006-atomic-ur-archival.md").exists())
+        self.assertTrue((ur_dir / "input.md").exists())
+        assert result.parent_result is not None
+        self.assertEqual(result.parent_result.outcome, "not-ready")
+        self.assertEqual(result.parent_result.missing_request_ids, ("REQ-007",))
+
+    def test_archive_completed_request_fails_loud_if_ur_was_already_archived(self) -> None:
+        working_dir = self.root / "working"
+        archive_ur_dir = self.root / "archive" / "UR-001"
+        working_dir.mkdir(parents=True, exist_ok=True)
+        archive_ur_dir.mkdir(parents=True, exist_ok=True)
+
+        working_req = working_dir / "REQ-006-atomic-ur-archival.md"
+        working_req.write_text(
+            self._req_frontmatter("REQ-006", user_request="UR-001"),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(ConcurrencyError) as ctx:
+            archive_completed_request(
+                self.root,
+                working_request_path=working_req,
+                session_id="session-1",
+            )
+
+        self.assertIn("already archived", str(ctx.exception))
+        self.assertTrue(working_req.exists())
+
+    def test_archive_completed_request_archives_legacy_context_once_all_reqs_are_done(self) -> None:
+        working_dir = self.root / "working"
+        archive_dir = self.root / "archive"
+        assets_dir = self.root / "assets"
+        working_dir.mkdir(parents=True, exist_ok=True)
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        assets_dir.mkdir(parents=True, exist_ok=True)
+
+        (assets_dir / "CONTEXT-001-batch.md").write_text(
+            self._context_input(["REQ-006"]),
+            encoding="utf-8",
+        )
+        working_req = working_dir / "REQ-006-legacy.md"
+        working_req.write_text(
+            self._req_frontmatter(
+                "REQ-006",
+                context_ref="assets/CONTEXT-001-batch.md",
+            ),
+            encoding="utf-8",
+        )
+
+        result = archive_completed_request(
+            self.root,
+            working_request_path=working_req,
+            session_id="session-1",
+        )
+
+        self.assertEqual(result.outcome, "archived-root")
+        self.assertTrue((archive_dir / "REQ-006-legacy.md").exists())
+        self.assertTrue((archive_dir / "CONTEXT-001-batch.md").exists())
+        self.assertFalse((assets_dir / "CONTEXT-001-batch.md").exists())
+        assert result.parent_result is not None
+        self.assertEqual(result.parent_result.kind, "legacy-context")
+        self.assertEqual(result.parent_result.outcome, "archived")
+
+    def test_archive_legacy_context_returns_already_archived_after_first_winner(self) -> None:
+        assets_dir = self.root / "assets"
+        archive_dir = self.root / "archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        assets_dir.mkdir(parents=True, exist_ok=True)
+
+        (archive_dir / "REQ-006-legacy.md").write_text(
+            self._req_frontmatter("REQ-006"),
+            encoding="utf-8",
+        )
+        (assets_dir / "CONTEXT-001-batch.md").write_text(
+            self._context_input(["REQ-006"]),
+            encoding="utf-8",
+        )
+
+        first = archive_legacy_context_if_complete(
+            self.root,
+            context_ref="assets/CONTEXT-001-batch.md",
+            session_id="session-1",
+        )
+        second = archive_legacy_context_if_complete(
+            self.root,
+            context_ref="assets/CONTEXT-001-batch.md",
+            session_id="session-2",
+        )
+
+        self.assertEqual(first.outcome, "archived")
+        self.assertEqual(second.outcome, "already-archived")
+
+    def test_parallel_ur_archival_has_one_winner_and_clean_losers(self) -> None:
+        archive_dir = self.root / "archive"
+        ur_dir = self.root / "user-requests" / "UR-001"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        ur_dir.mkdir(parents=True, exist_ok=True)
+
+        (ur_dir / "input.md").write_text(
+            self._ur_input("UR-001", ["REQ-006", "REQ-007"]),
+            encoding="utf-8",
+        )
+        (archive_dir / "REQ-006-a.md").write_text(
+            self._req_frontmatter("REQ-006", user_request="UR-001"),
+            encoding="utf-8",
+        )
+        (archive_dir / "REQ-007-b.md").write_text(
+            self._req_frontmatter("REQ-007", user_request="UR-001"),
+            encoding="utf-8",
+        )
+
+        ctx = multiprocessing.get_context("spawn")
+        start_event = ctx.Event()
+        result_queue = ctx.Queue()
+        processes = [
+            ctx.Process(
+                target=_ur_archival_race_worker,
+                args=(str(self.root), "UR-001", start_event, result_queue),
+            )
+            for _ in range(6)
+        ]
+
+        for process in processes:
+            process.start()
+
+        start_event.set()
+        results = [result_queue.get(timeout=5) for _ in range(6)]
+
+        for process in processes:
+            process.join(timeout=5)
+            self.assertEqual(process.exitcode, 0)
+
+        archived = [result for result in results if result[0] == "ok" and result[2] == "archived"]
+        already_archived = [
+            result for result in results if result[0] == "ok" and result[2] == "already-archived"
+        ]
+        errors = [result for result in results if result[0] == "error"]
+
+        self.assertEqual(len(archived), 1)
+        self.assertEqual(len(already_archived), 5)
+        self.assertEqual(errors, [])
+        self.assertTrue((archive_dir / "UR-001" / "REQ-006-a.md").exists())
+        self.assertTrue((archive_dir / "UR-001" / "REQ-007-b.md").exists())
+        self.assertFalse((self.root / "user-requests" / "UR-001").exists())
 
 
 if __name__ == "__main__":
