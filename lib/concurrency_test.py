@@ -11,6 +11,8 @@ from unittest import mock
 
 from lib.concurrency import (
     AtomicWriteError,
+    ClaimHandle,
+    ClaimHeldError,
     ClaimRecord,
     ClaimFormatError,
     CollisionError,
@@ -26,11 +28,15 @@ from lib.concurrency import (
     allocate_ur_input,
     atomic_rename,
     atomic_write,
+    claim_work_request,
     classify_lock,
     inspect_lock,
     read_claim,
+    refresh_claim_heartbeat,
+    release_claim,
     refresh_heartbeat,
     release_lock,
+    SessionClaimConflictError,
     write_claim,
 )
 
@@ -51,6 +57,28 @@ def _race_worker(lock_path: str, start_event, release_event, result_queue) -> No
     result_queue.put(("acquired", handle.info.session_id))
     release_event.wait(timeout=2)
     release_lock(handle)
+
+
+def _work_claim_race_worker(
+    do_work_root: str,
+    request_path: str,
+    start_event,
+    result_queue,
+) -> None:
+    start_event.wait()
+    session_id = f"session-{os.getpid()}"
+    try:
+        handle = claim_work_request(
+            do_work_root,
+            request_path=request_path,
+            session_id=session_id,
+            operation="work",
+        )
+    except ClaimHeldError as exc:
+        result_queue.put(("held", session_id, str(exc)))
+        return
+
+    result_queue.put(("acquired", session_id, handle.claim_path))
 
 
 class ConcurrencyPrimitivesTest(unittest.TestCase):
@@ -422,6 +450,49 @@ class ConcurrencyPrimitivesTest(unittest.TestCase):
         loaded = read_claim(path)
         self.assertEqual(loaded, claim)
 
+    def test_refresh_claim_heartbeat_updates_claimfile(self) -> None:
+        claim = ClaimRecord(
+            claim_id="REQ-002",
+            session_id="session-1",
+            operation="work",
+            scope="req-claim:REQ-002",
+            affected_paths=("do-work/working/REQ-002.md",),
+            acquired_at="2026-04-18T00:00:00Z",
+            last_heartbeat="2026-04-18T00:00:00Z",
+        )
+        path = self.root / "working" / "REQ-002.claim.json"
+        handle = ClaimHandle(path=str(path), claim=claim)
+
+        write_claim(path, claim)
+        refresh_claim_heartbeat(
+            handle,
+            now=datetime(2026, 4, 18, 0, 0, 45, tzinfo=timezone.utc),
+        )
+
+        loaded = read_claim(path)
+        self.assertEqual(loaded.last_heartbeat, "2026-04-18T00:00:45Z")
+        self.assertEqual(handle.claim.last_heartbeat, "2026-04-18T00:00:45Z")
+
+    def test_release_claim_rejects_foreign_session(self) -> None:
+        claim = ClaimRecord(
+            claim_id="REQ-002",
+            session_id="holder-session",
+            operation="work",
+            scope="req-claim:REQ-002",
+            affected_paths=("do-work/working/REQ-002.md",),
+            acquired_at="2026-04-18T00:00:00Z",
+            last_heartbeat="2026-04-18T00:00:30Z",
+        )
+        path = self.root / "working" / "REQ-002.claim.json"
+
+        write_claim(path, claim)
+        with self.assertRaises(ForeignReleaseError):
+            release_claim(path, expected_session_id="other-session")
+
+        self.assertTrue(path.exists())
+        release_claim(path, expected_session_id="holder-session")
+        self.assertFalse(path.exists())
+
     def test_claim_schema_rejects_unknown_scope(self) -> None:
         path = self.root / "claims" / "bad.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -451,6 +522,101 @@ class ConcurrencyPrimitivesTest(unittest.TestCase):
                 operation="work",
                 scope="unknown-scope",
             )
+
+    def test_claim_work_request_moves_file_and_writes_claim(self) -> None:
+        queue_req = self.root / "REQ-004-atomic-req-claim.md"
+        queue_req.write_text("payload\n", encoding="utf-8")
+
+        handle = claim_work_request(
+            self.root,
+            request_path=queue_req,
+            session_id="session-1",
+            operation="work",
+            now=datetime(2026, 4, 18, 0, 0, tzinfo=timezone.utc),
+        )
+
+        working_req = self.root / "working" / "REQ-004-atomic-req-claim.md"
+        claim_path = self.root / "working" / "REQ-004-atomic-req-claim.claim.json"
+        self.assertFalse(queue_req.exists())
+        self.assertEqual(Path(handle.request_path), working_req)
+        self.assertEqual(Path(handle.claim_path), claim_path)
+        self.assertEqual(working_req.read_text(encoding="utf-8"), "payload\n")
+
+        claim = read_claim(claim_path)
+        self.assertEqual(claim.claim_id, "REQ-004")
+        self.assertEqual(claim.session_id, "session-1")
+        self.assertEqual(
+            claim.affected_paths,
+            (str(working_req),),
+        )
+
+    def test_claim_work_request_reports_existing_holder(self) -> None:
+        queue_req = self.root / "REQ-004-atomic-req-claim.md"
+        queue_req.write_text("payload\n", encoding="utf-8")
+
+        claim_work_request(
+            self.root,
+            request_path=queue_req,
+            session_id="winner-session",
+            operation="work",
+        )
+
+        with self.assertRaises(ClaimHeldError) as ctx:
+            claim_work_request(
+                self.root,
+                request_path=self.root / "REQ-004-atomic-req-claim.md",
+                session_id="loser-session",
+                operation="work",
+            )
+
+        msg = str(ctx.exception)
+        self.assertIn("winner-session", msg)
+        self.assertIn("loser-session", msg)
+        self.assertIn("REQ-004", msg)
+
+    def test_claim_work_request_rejects_second_claim_for_same_session(self) -> None:
+        first_req = self.root / "REQ-004-atomic-req-claim.md"
+        second_req = self.root / "REQ-005-orphan-recovery.md"
+        first_req.write_text("first\n", encoding="utf-8")
+        second_req.write_text("second\n", encoding="utf-8")
+
+        claim_work_request(
+            self.root,
+            request_path=first_req,
+            session_id="session-1",
+            operation="work",
+        )
+
+        with self.assertRaises(SessionClaimConflictError) as ctx:
+            claim_work_request(
+                self.root,
+                request_path=second_req,
+                session_id="session-1",
+                operation="work",
+            )
+
+        self.assertIn("REQ-004", str(ctx.exception))
+        self.assertTrue(second_req.exists())
+
+    def test_claim_work_request_rolls_back_claim_if_move_fails(self) -> None:
+        queue_req = self.root / "REQ-004-atomic-req-claim.md"
+        queue_req.write_text("payload\n", encoding="utf-8")
+        claim_path = self.root / "working" / "REQ-004-atomic-req-claim.claim.json"
+
+        with mock.patch(
+            "lib.concurrency.atomic_rename",
+            side_effect=StaleRenameError("queue entry vanished"),
+        ):
+            with self.assertRaises(StaleRenameError):
+                claim_work_request(
+                    self.root,
+                    request_path=queue_req,
+                    session_id="session-1",
+                    operation="work",
+                )
+
+        self.assertFalse(claim_path.exists())
+        self.assertTrue(queue_req.exists())
 
     def test_twenty_processes_race_for_one_lock(self) -> None:
         lock_path = str(self.root / "locks" / "race.lock")
@@ -482,6 +648,44 @@ class ConcurrencyPrimitivesTest(unittest.TestCase):
         self.assertEqual(len(acquired), 1)
         self.assertEqual(len(held), 19)
         self.assertFalse(Path(lock_path).exists())
+
+    def test_parallel_work_claims_produce_exactly_one_winner(self) -> None:
+        queue_req = self.root / "REQ-004-atomic-req-claim.md"
+        queue_req.write_text("payload\n", encoding="utf-8")
+
+        ctx = multiprocessing.get_context("spawn")
+        start_event = ctx.Event()
+        result_queue = ctx.Queue()
+        processes = [
+            ctx.Process(
+                target=_work_claim_race_worker,
+                args=(str(self.root), str(queue_req), start_event, result_queue),
+            )
+            for _ in range(8)
+        ]
+
+        for process in processes:
+            process.start()
+
+        start_event.set()
+        results = [result_queue.get(timeout=5) for _ in range(8)]
+
+        for process in processes:
+            process.join(timeout=5)
+            self.assertEqual(process.exitcode, 0)
+
+        acquired = [result for result in results if result[0] == "acquired"]
+        held = [result for result in results if result[0] == "held"]
+        self.assertEqual(len(acquired), 1)
+        self.assertEqual(len(held), 7)
+
+        winner_session = acquired[0][1]
+        for _, _, message in held:
+            self.assertIn(winner_session, message)
+
+        self.assertFalse(queue_req.exists())
+        self.assertTrue((self.root / "working" / "REQ-004-atomic-req-claim.md").exists())
+        self.assertTrue((self.root / "working" / "REQ-004-atomic-req-claim.claim.json").exists())
 
 
 if __name__ == "__main__":

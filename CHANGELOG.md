@@ -4,6 +4,18 @@ What's new, what's better, what's different. Most recent stuff on top.
 
 ---
 
+## 0.16.0 — The Bouncer (2026-04-20)
+
+Work claims are now atomic and single-winner. Two sessions racing for the same REQ can no longer both move it into `working/` — one wins, the other gets a clear error naming the holder. Under the hood, claiming writes an `O_EXCL` sidecar `.claim.json` next to the REQ and only then renames the REQ into place; a failed rename rolls the sidecar back cleanly.
+
+- Added `claim_work_request`, `release_claim`, `refresh_claim_heartbeat` + `ClaimHeldError` / `SessionClaimConflictError` in `lib/concurrency.py`
+- 7 new concurrency tests including a 20-process race that proves exactly one winner (30 total, all green)
+- `actions/work.md` Step 2 rewritten to use the atomic helper; one-claim-per-session enforced
+- **Removed** the 1-hour TTL auto-unclaim — pure-timestamp guessing was incompatible with REQ-001's heartbeat model and UR-001's binding recovery decision. Recovery belongs to REQ-005, landing next
+- Archived `REQ-004` as completed
+
+---
+
 ## 0.15.2 — The Turnstile (2026-04-18)
 
 Parallel capture stops guessing IDs now. REQ and UR allocation both go through short namespace locks, so concurrent sessions mint unique placeholders on disk before they let go.

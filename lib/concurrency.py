@@ -82,6 +82,38 @@ class ClaimFormatError(ConcurrencyError):
     """Raised when a claim file fails to parse or is missing required fields."""
 
 
+class ClaimHeldError(ConcurrencyError):
+    """Raised when a claim file already exists for the requested resource."""
+
+    def __init__(
+        self,
+        *,
+        path: PathLike,
+        claim: "ClaimRecord",
+        attempting_session_id: str,
+        attempting_operation: str,
+    ) -> None:
+        self.path = os.fspath(path)
+        self.claim = claim
+        self.attempting_session_id = attempting_session_id
+        self.attempting_operation = attempting_operation
+        msg = (
+            f"claim {self.path!r} is already held\n"
+            f"  claim_id:       {claim.claim_id}\n"
+            f"  held_by:        session {claim.session_id} "
+            f"(operation: {claim.operation})\n"
+            f"  acquired_at:    {claim.acquired_at}\n"
+            f"  last_heartbeat: {claim.last_heartbeat}\n"
+            f"  attempting:     session {attempting_session_id} "
+            f"(operation: {attempting_operation})"
+        )
+        super().__init__(msg)
+
+
+class SessionClaimConflictError(ConcurrencyError):
+    """Raised when one session tries to hold multiple work claims at once."""
+
+
 class ScopeError(ConcurrencyError):
     """Raised when a scope name is not in the canonical catalog."""
 
@@ -322,6 +354,19 @@ class LockHandle:
     info: LockInfo
 
 
+@dataclass
+class ClaimHandle:
+    path: str
+    claim: "ClaimRecord"
+
+
+@dataclass
+class WorkClaimHandle:
+    request_path: str
+    claim_path: str
+    claim: "ClaimRecord"
+
+
 @dataclass(frozen=True)
 class ClaimRecord:
     claim_id: str
@@ -442,6 +487,28 @@ def _write_lockfile_exclusive(path: str, info: LockInfo) -> None:
         raise
 
 
+def _write_claim_exclusive(path: str, claim: ClaimRecord) -> None:
+    """Create path with O_CREAT|O_EXCL and write the claim JSON."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(claim.to_dict(), f, indent=2, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+
+
 def _inspect_lock_after_contention(
     path: str,
     *,
@@ -458,6 +525,50 @@ def _inspect_lock_after_contention(
     if last_error is not None:
         raise last_error
     return None
+
+
+def _inspect_claim_after_contention(
+    path: str,
+    *,
+    attempts: int = 5,
+    retry_interval_seconds: float = 0.01,
+) -> Optional[ClaimRecord]:
+    last_error: Optional[ClaimFormatError] = None
+    for _ in range(attempts):
+        try:
+            return read_claim(path)
+        except ClaimFormatError as exc:
+            last_error = exc
+            time.sleep(retry_interval_seconds)
+    if last_error is not None:
+        raise last_error
+    return None
+
+
+def _req_identifier_from_path(path: Path) -> str:
+    number = _extract_identifier_number(path, "req")
+    if number is None:
+        raise ConcurrencyError(
+            f"work claim requires a REQ filename, got {os.fspath(path)!r}"
+        )
+    return _format_identifier("req", number)
+
+
+def _work_request_path(do_work_root: PathLike, request_path: PathLike) -> Path:
+    root = _coerce_do_work_root(do_work_root)
+    candidate = Path(os.fspath(request_path))
+    if candidate.is_absolute():
+        return candidate
+    return root / candidate
+
+
+def _work_claim_path(working_request_path: Path) -> Path:
+    return working_request_path.with_suffix(".claim.json")
+
+
+def _iter_work_claim_paths(do_work_root: PathLike) -> Iterable[Path]:
+    root = _coerce_do_work_root(do_work_root)
+    yield from (root / "working").glob("*.claim.json")
 
 
 def acquire_lock(
@@ -653,6 +764,150 @@ def write_claim(path: PathLike, claim: ClaimRecord) -> None:
     atomic_write(path, json.dumps(claim.to_dict(), indent=2, sort_keys=True) + "\n")
 
 
+def release_claim(
+    handle_or_path: Union[ClaimHandle, PathLike],
+    *,
+    expected_session_id: Optional[str] = None,
+) -> None:
+    """Remove a claim file, optionally asserting ownership."""
+    if isinstance(handle_or_path, ClaimHandle):
+        path = handle_or_path.path
+        if expected_session_id is None:
+            expected_session_id = handle_or_path.claim.session_id
+    else:
+        path = os.fspath(handle_or_path)
+
+    try:
+        current = read_claim(path)
+    except ClaimFormatError as exc:
+        if not os.path.exists(path):
+            return
+        raise
+
+    if expected_session_id is not None and current.session_id != expected_session_id:
+        raise ForeignReleaseError(
+            f"refusing to release claim {path!r}: held by session "
+            f"{current.session_id!r}, expected {expected_session_id!r}"
+        )
+
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def refresh_claim_heartbeat(
+    handle_or_path: Union[ClaimHandle, PathLike],
+    *,
+    now: Optional[datetime] = None,
+) -> None:
+    """Rewrite last_heartbeat on a claim file via atomic write."""
+    if isinstance(handle_or_path, ClaimHandle):
+        path = handle_or_path.path
+        expected_session_id = handle_or_path.claim.session_id
+    else:
+        path = os.fspath(handle_or_path)
+        expected_session_id = None
+
+    current = read_claim(path)
+    if expected_session_id is not None and current.session_id != expected_session_id:
+        raise ForeignReleaseError(
+            f"refusing to refresh claim heartbeat on {path!r}: held by session "
+            f"{current.session_id!r}, expected {expected_session_id!r}"
+        )
+
+    updated = ClaimRecord(
+        claim_id=current.claim_id,
+        session_id=current.session_id,
+        operation=current.operation,
+        scope=current.scope,
+        affected_paths=current.affected_paths,
+        acquired_at=current.acquired_at,
+        last_heartbeat=_iso(now or _utcnow()),
+    )
+    write_claim(path, updated)
+    if isinstance(handle_or_path, ClaimHandle):
+        handle_or_path.claim = updated
+
+
+def claim_work_request(
+    do_work_root: PathLike,
+    *,
+    request_path: PathLike,
+    session_id: str,
+    operation: str = "work",
+    now: Optional[datetime] = None,
+) -> WorkClaimHandle:
+    """Claim a queued REQ for the work action with an exclusive claim file.
+
+    The exclusive-create of the claim sidecar is the claim point. Once that
+    succeeds, the queued REQ is atomically renamed into working/. If the move
+    fails, the just-created claim is rolled back before the error is raised.
+    """
+    root = _coerce_do_work_root(do_work_root)
+    queue_request = _work_request_path(root, request_path)
+    if queue_request.parent != root:
+        raise ConcurrencyError(
+            "work claims must start from the do-work/ queue root"
+        )
+
+    req_id = _req_identifier_from_path(queue_request)
+    working_dir = root / "working"
+    os.makedirs(working_dir, exist_ok=True)
+    working_request = working_dir / queue_request.name
+    claim_path = _work_claim_path(working_request)
+
+    for existing_path in _iter_work_claim_paths(root):
+        existing = _inspect_claim_after_contention(os.fspath(existing_path))
+        if existing is None:
+            continue
+        if existing.session_id == session_id and existing.claim_id != req_id:
+            raise SessionClaimConflictError(
+                f"session {session_id!r} already holds work claim "
+                f"{existing.claim_id!r} at {os.fspath(existing_path)!r}"
+            )
+
+    now_s = _iso(now or _utcnow())
+    claim = ClaimRecord(
+        claim_id=req_id,
+        session_id=session_id,
+        operation=operation,
+        scope=f"req-claim:{req_id}",
+        affected_paths=(os.fspath(working_request),),
+        acquired_at=now_s,
+        last_heartbeat=now_s,
+    )
+
+    try:
+        _write_claim_exclusive(os.fspath(claim_path), claim)
+    except FileExistsError:
+        holder = _inspect_claim_after_contention(os.fspath(claim_path))
+        if holder is None:
+            holder = claim
+        raise ClaimHeldError(
+            path=claim_path,
+            claim=holder,
+            attempting_session_id=session_id,
+            attempting_operation=operation,
+        )
+
+    try:
+        atomic_rename(
+            queue_request,
+            working_request,
+            transition=f"queue->working for {req_id}",
+        )
+    except Exception:
+        release_claim(claim_path, expected_session_id=session_id)
+        raise
+
+    return WorkClaimHandle(
+        request_path=os.fspath(working_request),
+        claim_path=os.fspath(claim_path),
+        claim=claim,
+    )
+
+
 def allocate_ur_input(
     do_work_root: PathLike,
     *,
@@ -766,6 +1021,8 @@ __all__ = [
     "ConcurrencyError",
     "LockHeldError",
     "ClaimFormatError",
+    "ClaimHeldError",
+    "SessionClaimConflictError",
     "ScopeError",
     "StaleRenameError",
     "CrossDeviceError",
@@ -775,6 +1032,8 @@ __all__ = [
     "AllocatedId",
     "LockInfo",
     "LockHandle",
+    "ClaimHandle",
+    "WorkClaimHandle",
     "ClaimRecord",
     "validate_scope",
     "acquire_lock",
@@ -786,6 +1045,9 @@ __all__ = [
     "atomic_write",
     "read_claim",
     "write_claim",
+    "release_claim",
+    "refresh_claim_heartbeat",
+    "claim_work_request",
     "allocate_ur_input",
     "allocate_req_file",
 ]
