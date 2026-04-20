@@ -1,8 +1,11 @@
 ---
 id: REQ-005
 title: Evidence-based orphan claim recovery
-status: pending
+status: completed
 created_at: 2026-04-17T23:50:00Z
+claimed_at: 2026-04-20T20:56:09Z
+completed_at: 2026-04-20T21:06:33Z
+route: C
 user_request: UR-001
 related: [REQ-001, REQ-002, REQ-004]
 batch: parallel-safety
@@ -77,3 +80,68 @@ See [user-requests/UR-001/input.md](./user-requests/UR-001/input.md) — "Orphan
 | 5 | "Auto-recover only the unequivocal… ambiguous situations must surface to the user and halt" (Resolved decision — Recovery policy) | Detailed Requirements — Fail-loud ambiguity, Recovery is an explicit action | Full |
 
 *Verified by verify-request action*
+
+---
+
+## Triage
+
+**Route: C** — Complex
+
+**Reasoning:** This REQ adds a new explicit recovery path, new runtime helpers, new recovery logging on disk, and changes the `work` action's operator flow. It spans the shared concurrency library, its test suite, and the work-action contract itself.
+
+## Plan
+
+1. Extend `lib/concurrency.py` with explicit recovery primitives: session-record parsing, work-claim inspection, and a recovery helper that only acts on unequivocal orphan evidence and logs every recovery on disk.
+2. Add isolated tests in `lib/concurrency_test.py` for missing-session, foreign-host, ambiguous-live-PID, recoverable orphan, and successful recovery that moves the REQ back to the queue and removes both claim + session record.
+3. Rewire `actions/work.md` so the normal `do work` loop never auto-recovers, and `do work resume` becomes the single explicit recovery path with fail-loud behavior and breadcrumbs back into the REQ.
+4. Update the concurrency-primitives contract doc so the new recovery APIs and failure modes are part of the documented surface.
+
+## Plan Verification
+
+**Source**: REQ-005 (10 items enumerated from Detailed Requirements + Constraints + Builder Guidance)
+**Pre-fix coverage**: 100% (10/10 items addressed)
+
+### Coverage Map
+
+| # | Requirement | Plan Step | Status |
+|---|-------------|-----------|--------|
+| 1 | Two-signal recovery: stale heartbeat + absent process on same host | Steps 1, 3 | Full |
+| 2 | No pure TTL reclaim path | Steps 1, 3 | Full |
+| 3 | Single-machine scope; foreign host must fail loud | Steps 1, 2, 3 | Full |
+| 4 | Ambiguous cases (PID still alive / conflicting evidence) must halt | Steps 1, 2, 3 | Full |
+| 5 | Recovery is explicit, not hidden inside claim attempts | Step 3 | Full |
+| 6 | Recovery returns REQ to queue with visible breadcrumbs | Step 3 | Full |
+| 7 | Every recovery is logged on disk with evidence | Steps 1, 3, 4 | Full |
+| 8 | Recovery also cleans up the session record | Steps 1, 2 | Full |
+| 9 | Stale-threshold tuning stays in REQ-001; REQ-005 does not retune it | Steps 1, 3 | Full |
+| 10 | Process-absence check stays host-local and stdlib-only | Steps 1, 2, 3 | Full |
+
+## Exploration
+
+- `lib/concurrency.py` already had `classify_lock(...)`, claim parsing, and atomic claim acquisition from REQ-004, but nothing that connected a work claim back to the owning session record or produced a recovery verdict for explicit operator use.
+- `actions/work.md` already banned auto-recovery in the normal queue loop and reserved `do work resume`, which made it the right hook for REQ-005's explicit recovery path.
+- The current work-claim schema stores `session_id` and claim heartbeat, while `actions/session-identity.md` defines the matching `.sessions/<session_id>.json` record that carries `pid` and `hostname`. Recovery therefore had to join those two files rather than mutate the claim format again.
+- PID reuse cannot be proven away cheaply with stdlib-only Python on macOS + Linux, so the safe policy is to treat any still-live PID as ambiguous and refuse recovery.
+
+## Implementation Summary
+
+- Added session-record helpers to `lib/concurrency.py`: `SessionRecord`, `read_session_record`, `write_session_record`, and `inspect_session_record`.
+- Added explicit orphan-recovery helpers: `inspect_work_claim_recovery(...)` returns a concrete verdict (`live`, `stale`, `recoverable`, `foreign-host`, `missing-session-record`), and `recover_orphaned_work_claim(...)` moves the REQ back to the queue, writes `do-work/.recovery-log/<timestamp>-REQ-XXX.json`, releases the claim sidecar, and deletes the originating session record.
+- Added fail-loud recovery errors and evidence-rich dataclasses so callers can surface the exact reason a claim was or was not recoverable.
+- Expanded `lib/concurrency_test.py` with recovery-focused coverage: missing session record, foreign host, ambiguous live PID, recoverable orphan, successful recovery, and rejection of ambiguous recovery attempts.
+- Rewrote `actions/work.md` so the normal `do work` loop still refuses to guess, while `do work resume` now documents the full explicit recovery workflow, breadcrumb frontmatter updates, and recovery-log visibility requirements.
+- Updated `actions/concurrency-primitives.md` so the recovery helpers and their error model are part of the shared contract instead of hidden implementation detail.
+
+## Testing
+
+**Tests run:** `python3 -m unittest lib.concurrency_test -v`
+**Result:** ✓ 37 tests passing
+
+**Recovery-specific coverage added:**
+- Session-record round trip
+- Missing session record → fail loud
+- Foreign host → fail loud
+- Stale heartbeat + live PID → ambiguous, no recovery
+- Stale claim + stale session + absent PID → recoverable
+- Successful recovery moves REQ back to queue, logs it, removes claim, deletes session record
+- Ambiguous recovery attempts raise `RecoveryNotAllowedError`

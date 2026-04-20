@@ -139,6 +139,14 @@ class ForeignReleaseError(ConcurrencyError):
     the on-disk lockfile (the lock was replaced by a different session)."""
 
 
+class SessionFormatError(ConcurrencyError):
+    """Raised when a session record fails to parse or is missing fields."""
+
+
+class RecoveryNotAllowedError(ConcurrencyError):
+    """Raised when explicit orphan recovery is attempted without clear evidence."""
+
+
 @dataclass(frozen=True)
 class AllocatedId:
     identifier: str
@@ -405,6 +413,83 @@ class ClaimRecord:
         return d
 
 
+@dataclass(frozen=True)
+class SessionRecord:
+    session_id: str
+    hostname: str
+    pid: int
+    started_at: str
+    last_heartbeat: str
+    operation: str
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "SessionRecord":
+        required = {
+            "session_id", "hostname", "pid",
+            "started_at", "last_heartbeat", "operation",
+        }
+        missing = required - set(d)
+        if missing:
+            raise SessionFormatError(
+                f"session record missing fields: {sorted(missing)}"
+            )
+        return cls(**{k: d[k] for k in required})
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class WorkClaimRecoveryInspection:
+    claim_path: str
+    request_path: str
+    queue_path: str
+    session_record_path: str
+    claim: ClaimRecord
+    session_record: Optional[SessionRecord]
+    verdict: Literal["live", "stale", "recoverable", "foreign-host", "missing-session-record"]
+    reason: str
+    claim_heartbeat_stale: bool
+    session_heartbeat_stale: Optional[bool]
+    process_alive: Optional[bool]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "claim_path": self.claim_path,
+            "request_path": self.request_path,
+            "queue_path": self.queue_path,
+            "session_record_path": self.session_record_path,
+            "claim": self.claim.to_dict(),
+            "session_record": (
+                None if self.session_record is None else self.session_record.to_dict()
+            ),
+            "verdict": self.verdict,
+            "reason": self.reason,
+            "claim_heartbeat_stale": self.claim_heartbeat_stale,
+            "session_heartbeat_stale": self.session_heartbeat_stale,
+            "process_alive": self.process_alive,
+        }
+
+
+@dataclass(frozen=True)
+class RecoveredWorkClaim:
+    claim_id: str
+    released_session_id: str
+    recovered_by_session_id: str
+    recovered_at: str
+    claim_path: str
+    working_request_path: str
+    queue_request_path: str
+    log_path: str
+    claim_last_heartbeat: str
+    session_last_heartbeat: str
+    session_pid: int
+    session_hostname: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def atomic_write(path: PathLike, content: str, *, mode: str = "w") -> None:
     """Write content to path via write-to-temp-then-rename.
 
@@ -569,6 +654,22 @@ def _work_claim_path(working_request_path: Path) -> Path:
 def _iter_work_claim_paths(do_work_root: PathLike) -> Iterable[Path]:
     root = _coerce_do_work_root(do_work_root)
     yield from (root / "working").glob("*.claim.json")
+
+
+def _session_record_path(do_work_root: PathLike, session_id: str) -> Path:
+    root = _coerce_do_work_root(do_work_root)
+    return root / ".sessions" / f"{session_id}.json"
+
+
+def _recovery_log_path(
+    do_work_root: PathLike,
+    *,
+    claim_id: str,
+    recovered_at: str,
+) -> Path:
+    root = _coerce_do_work_root(do_work_root)
+    stamp = recovered_at.replace(":", "-")
+    return root / ".recovery-log" / f"{stamp}-{claim_id}.json"
 
 
 def acquire_lock(
@@ -748,6 +849,40 @@ def classify_lock(
     return "orphaned" if not _pid_alive(info.pid) else "stale"
 
 
+def read_session_record(path: PathLike) -> SessionRecord:
+    target = os.fspath(path)
+    try:
+        with open(target, "r") as f:
+            data = json.load(f)
+    except FileNotFoundError as e:
+        raise SessionFormatError(f"session record {target!r} not found") from e
+    except json.JSONDecodeError as e:
+        raise SessionFormatError(
+            f"session record {target!r} is not valid JSON: {e}"
+        ) from e
+    return SessionRecord.from_dict(data)
+
+
+def write_session_record(path: PathLike, record: SessionRecord) -> None:
+    atomic_write(
+        path,
+        json.dumps(record.to_dict(), indent=2, sort_keys=True) + "\n",
+    )
+
+
+def inspect_session_record(
+    do_work_root: PathLike,
+    session_id: str,
+) -> Optional[SessionRecord]:
+    path = _session_record_path(do_work_root, session_id)
+    try:
+        return read_session_record(path)
+    except SessionFormatError as exc:
+        if not os.path.exists(path):
+            return None
+        raise
+
+
 def read_claim(path: PathLike) -> ClaimRecord:
     target = os.fspath(path)
     try:
@@ -908,6 +1043,237 @@ def claim_work_request(
     )
 
 
+def inspect_work_claim_recovery(
+    do_work_root: PathLike,
+    *,
+    claim_path: PathLike,
+    now: Optional[datetime] = None,
+    stale_threshold: timedelta = timedelta(minutes=2),
+) -> WorkClaimRecoveryInspection:
+    root = _coerce_do_work_root(do_work_root)
+    claim = read_claim(claim_path)
+    if not claim.affected_paths:
+        raise RecoveryNotAllowedError(
+            f"claim {os.fspath(claim_path)!r} has no affected_paths"
+        )
+
+    working_request = Path(claim.affected_paths[0])
+    queue_request = root / working_request.name
+    session_path = _session_record_path(root, claim.session_id)
+    current = now or _utcnow()
+    claim_age = current - _parse_iso(claim.last_heartbeat)
+    claim_stale = claim_age >= stale_threshold
+
+    session_record = inspect_session_record(root, claim.session_id)
+    if not claim_stale:
+        return WorkClaimRecoveryInspection(
+            claim_path=os.fspath(claim_path),
+            request_path=os.fspath(working_request),
+            queue_path=os.fspath(queue_request),
+            session_record_path=os.fspath(session_path),
+            claim=claim,
+            session_record=session_record,
+            verdict="live",
+            reason=(
+                f"claim heartbeat {claim.last_heartbeat} is within the stale threshold"
+            ),
+            claim_heartbeat_stale=False,
+            session_heartbeat_stale=(
+                None if session_record is None else
+                current - _parse_iso(session_record.last_heartbeat) >= stale_threshold
+            ),
+            process_alive=None if session_record is None else _pid_alive(session_record.pid),
+        )
+
+    if session_record is None:
+        return WorkClaimRecoveryInspection(
+            claim_path=os.fspath(claim_path),
+            request_path=os.fspath(working_request),
+            queue_path=os.fspath(queue_request),
+            session_record_path=os.fspath(session_path),
+            claim=claim,
+            session_record=None,
+            verdict="missing-session-record",
+            reason=(
+                f"claim heartbeat is stale but session record {os.fspath(session_path)!r} "
+                "is missing; recovery would have to guess"
+            ),
+            claim_heartbeat_stale=True,
+            session_heartbeat_stale=None,
+            process_alive=None,
+        )
+
+    session_age = current - _parse_iso(session_record.last_heartbeat)
+    session_stale = session_age >= stale_threshold
+
+    if session_record.hostname != socket.gethostname():
+        return WorkClaimRecoveryInspection(
+            claim_path=os.fspath(claim_path),
+            request_path=os.fspath(working_request),
+            queue_path=os.fspath(queue_request),
+            session_record_path=os.fspath(session_path),
+            claim=claim,
+            session_record=session_record,
+            verdict="foreign-host",
+            reason=(
+                f"session {session_record.session_id} was recorded on host "
+                f"{session_record.hostname!r}; current host is {socket.gethostname()!r}"
+            ),
+            claim_heartbeat_stale=True,
+            session_heartbeat_stale=session_stale,
+            process_alive=None,
+        )
+
+    process_alive = _pid_alive(session_record.pid)
+    if not session_stale:
+        return WorkClaimRecoveryInspection(
+            claim_path=os.fspath(claim_path),
+            request_path=os.fspath(working_request),
+            queue_path=os.fspath(queue_request),
+            session_record_path=os.fspath(session_path),
+            claim=claim,
+            session_record=session_record,
+            verdict="stale",
+            reason=(
+                "claim heartbeat is stale but the owning session record is still fresh"
+            ),
+            claim_heartbeat_stale=True,
+            session_heartbeat_stale=False,
+            process_alive=process_alive,
+        )
+
+    if process_alive:
+        return WorkClaimRecoveryInspection(
+            claim_path=os.fspath(claim_path),
+            request_path=os.fspath(working_request),
+            queue_path=os.fspath(queue_request),
+            session_record_path=os.fspath(session_path),
+            claim=claim,
+            session_record=session_record,
+            verdict="stale",
+            reason=(
+                f"claim and session heartbeats are stale but PID {session_record.pid} "
+                "still exists on this host; recovery is ambiguous"
+            ),
+            claim_heartbeat_stale=True,
+            session_heartbeat_stale=True,
+            process_alive=True,
+        )
+
+    return WorkClaimRecoveryInspection(
+        claim_path=os.fspath(claim_path),
+        request_path=os.fspath(working_request),
+        queue_path=os.fspath(queue_request),
+        session_record_path=os.fspath(session_path),
+        claim=claim,
+        session_record=session_record,
+        verdict="recoverable",
+        reason=(
+            "claim heartbeat is stale, the owning session heartbeat is stale, "
+            "and the owning PID is absent on this host"
+        ),
+        claim_heartbeat_stale=True,
+        session_heartbeat_stale=True,
+        process_alive=False,
+    )
+
+
+def recover_orphaned_work_claim(
+    do_work_root: PathLike,
+    *,
+    claim_path: PathLike,
+    recovering_session_id: str,
+    now: Optional[datetime] = None,
+    stale_threshold: timedelta = timedelta(minutes=2),
+) -> RecoveredWorkClaim:
+    inspection = inspect_work_claim_recovery(
+        do_work_root,
+        claim_path=claim_path,
+        now=now,
+        stale_threshold=stale_threshold,
+    )
+    if inspection.verdict != "recoverable" or inspection.session_record is None:
+        raise RecoveryNotAllowedError(
+            f"cannot recover {os.fspath(claim_path)!r}: {inspection.reason}"
+        )
+
+    recovered_at = _iso(now or _utcnow())
+    working_request = inspection.request_path
+    queue_request = inspection.queue_path
+    log_path = _recovery_log_path(
+        do_work_root,
+        claim_id=inspection.claim.claim_id,
+        recovered_at=recovered_at,
+    )
+    log_entry = {
+        "recovered_at": recovered_at,
+        "claim_id": inspection.claim.claim_id,
+        "released_session_id": inspection.claim.session_id,
+        "recovered_by_session_id": recovering_session_id,
+        "claim_path": inspection.claim_path,
+        "working_request_path": working_request,
+        "queue_request_path": queue_request,
+        "evidence": inspection.to_dict(),
+    }
+
+    atomic_rename(
+        working_request,
+        queue_request,
+        transition=f"orphan-recovery working->queue for {inspection.claim.claim_id}",
+    )
+    try:
+        atomic_write(
+            log_path,
+            json.dumps(log_entry, indent=2, sort_keys=True) + "\n",
+        )
+    except Exception:
+        try:
+            atomic_rename(
+                queue_request,
+                working_request,
+                transition=(
+                    f"orphan-recovery rollback for {inspection.claim.claim_id}"
+                ),
+            )
+        except Exception as rollback_exc:
+            raise ConcurrencyError(
+                "orphan recovery moved the request but failed to write the recovery "
+                f"log at {os.fspath(log_path)!r}; rollback also failed"
+            ) from rollback_exc
+        raise
+
+    release_claim(
+        inspection.claim_path,
+        expected_session_id=inspection.claim.session_id,
+    )
+
+    session_path = inspection.session_record_path
+    try:
+        os.unlink(session_path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise ConcurrencyError(
+            f"recovered {inspection.claim.claim_id} but failed to delete session "
+            f"record {session_path!r}: {exc}"
+        ) from exc
+
+    return RecoveredWorkClaim(
+        claim_id=inspection.claim.claim_id,
+        released_session_id=inspection.claim.session_id,
+        recovered_by_session_id=recovering_session_id,
+        recovered_at=recovered_at,
+        claim_path=inspection.claim_path,
+        working_request_path=working_request,
+        queue_request_path=queue_request,
+        log_path=os.fspath(log_path),
+        claim_last_heartbeat=inspection.claim.last_heartbeat,
+        session_last_heartbeat=inspection.session_record.last_heartbeat,
+        session_pid=inspection.session_record.pid,
+        session_hostname=inspection.session_record.hostname,
+    )
+
+
 def allocate_ur_input(
     do_work_root: PathLike,
     *,
@@ -1029,12 +1395,17 @@ __all__ = [
     "CollisionError",
     "AtomicWriteError",
     "ForeignReleaseError",
+    "SessionFormatError",
+    "RecoveryNotAllowedError",
     "AllocatedId",
     "LockInfo",
     "LockHandle",
     "ClaimHandle",
     "WorkClaimHandle",
     "ClaimRecord",
+    "SessionRecord",
+    "WorkClaimRecoveryInspection",
+    "RecoveredWorkClaim",
     "validate_scope",
     "acquire_lock",
     "release_lock",
@@ -1043,11 +1414,16 @@ __all__ = [
     "classify_lock",
     "atomic_rename",
     "atomic_write",
+    "read_session_record",
+    "write_session_record",
+    "inspect_session_record",
     "read_claim",
     "write_claim",
     "release_claim",
     "refresh_claim_heartbeat",
     "claim_work_request",
+    "inspect_work_claim_recovery",
+    "recover_orphaned_work_claim",
     "allocate_ur_input",
     "allocate_req_file",
 ]

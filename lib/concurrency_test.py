@@ -21,7 +21,10 @@ from lib.concurrency import (
     LockHandle,
     LockHeldError,
     LockInfo,
+    RecoveryNotAllowedError,
     ScopeError,
+    SessionFormatError,
+    SessionRecord,
     StaleRenameError,
     acquire_lock,
     allocate_req_file,
@@ -30,13 +33,18 @@ from lib.concurrency import (
     atomic_write,
     claim_work_request,
     classify_lock,
+    inspect_session_record,
+    inspect_work_claim_recovery,
     inspect_lock,
     read_claim,
+    read_session_record,
+    recover_orphaned_work_claim,
     refresh_claim_heartbeat,
     release_claim,
     refresh_heartbeat,
     release_lock,
     SessionClaimConflictError,
+    write_session_record,
     write_claim,
 )
 
@@ -492,6 +500,235 @@ class ConcurrencyPrimitivesTest(unittest.TestCase):
         self.assertTrue(path.exists())
         release_claim(path, expected_session_id="holder-session")
         self.assertFalse(path.exists())
+
+    def test_session_record_round_trip(self) -> None:
+        record = SessionRecord(
+            session_id="session-1",
+            hostname="test-host",
+            pid=1234,
+            started_at="2026-04-20T20:00:00Z",
+            last_heartbeat="2026-04-20T20:00:30Z",
+            operation="work",
+        )
+        path = self.root / "do-work" / ".sessions" / "session-1.json"
+
+        write_session_record(path, record)
+        loaded = read_session_record(path)
+        self.assertEqual(loaded, record)
+        inspected = inspect_session_record(self.root / "do-work", "session-1")
+        self.assertEqual(inspected, record)
+
+    def test_inspect_work_claim_recovery_reports_missing_session_record(self) -> None:
+        do_work_root = self.root / "do-work"
+        request_path = do_work_root / "REQ-005-orphan.md"
+        request_path.parent.mkdir(parents=True, exist_ok=True)
+        request_path.write_text("queued\n", encoding="utf-8")
+        claim_time = datetime(2026, 4, 20, 20, 0, tzinfo=timezone.utc)
+        handle = claim_work_request(
+            do_work_root,
+            request_path=request_path,
+            session_id="session-ghost",
+            operation="work",
+            now=claim_time,
+        )
+
+        inspection = inspect_work_claim_recovery(
+            do_work_root,
+            claim_path=handle.claim_path,
+            now=claim_time + timedelta(minutes=5),
+        )
+
+        self.assertEqual(inspection.verdict, "missing-session-record")
+        self.assertIn("missing", inspection.reason)
+
+    def test_inspect_work_claim_recovery_reports_foreign_host(self) -> None:
+        do_work_root = self.root / "do-work"
+        request_path = do_work_root / "REQ-005-foreign.md"
+        request_path.parent.mkdir(parents=True, exist_ok=True)
+        request_path.write_text("queued\n", encoding="utf-8")
+        claim_time = datetime(2026, 4, 20, 20, 0, tzinfo=timezone.utc)
+        handle = claim_work_request(
+            do_work_root,
+            request_path=request_path,
+            session_id="session-foreign",
+            operation="work",
+            now=claim_time,
+        )
+        write_session_record(
+            do_work_root / ".sessions" / "session-foreign.json",
+            SessionRecord(
+                session_id="session-foreign",
+                hostname="other-host",
+                pid=999999,
+                started_at="2026-04-20T20:00:00Z",
+                last_heartbeat="2026-04-20T20:00:00Z",
+                operation="work",
+            ),
+        )
+
+        with mock.patch("lib.concurrency.socket.gethostname", return_value="local-host"):
+            inspection = inspect_work_claim_recovery(
+                do_work_root,
+                claim_path=handle.claim_path,
+                now=claim_time + timedelta(minutes=5),
+            )
+
+        self.assertEqual(inspection.verdict, "foreign-host")
+        self.assertIn("other-host", inspection.reason)
+
+    def test_inspect_work_claim_recovery_reports_stale_when_process_still_exists(self) -> None:
+        do_work_root = self.root / "do-work"
+        request_path = do_work_root / "REQ-005-stale.md"
+        request_path.parent.mkdir(parents=True, exist_ok=True)
+        request_path.write_text("queued\n", encoding="utf-8")
+        claim_time = datetime(2026, 4, 20, 20, 0, tzinfo=timezone.utc)
+        handle = claim_work_request(
+            do_work_root,
+            request_path=request_path,
+            session_id="session-stale",
+            operation="work",
+            now=claim_time,
+        )
+        write_session_record(
+            do_work_root / ".sessions" / "session-stale.json",
+            SessionRecord(
+                session_id="session-stale",
+                hostname="local-host",
+                pid=1234,
+                started_at="2026-04-20T20:00:00Z",
+                last_heartbeat="2026-04-20T20:00:00Z",
+                operation="work",
+            ),
+        )
+
+        with mock.patch("lib.concurrency.socket.gethostname", return_value="local-host"):
+            with mock.patch("lib.concurrency._pid_alive", return_value=True):
+                inspection = inspect_work_claim_recovery(
+                    do_work_root,
+                    claim_path=handle.claim_path,
+                    now=claim_time + timedelta(minutes=5),
+                )
+
+        self.assertEqual(inspection.verdict, "stale")
+        self.assertTrue(inspection.process_alive)
+
+    def test_inspect_work_claim_recovery_reports_recoverable_when_stale_and_pid_absent(self) -> None:
+        do_work_root = self.root / "do-work"
+        request_path = do_work_root / "REQ-005-recoverable.md"
+        request_path.parent.mkdir(parents=True, exist_ok=True)
+        request_path.write_text("queued\n", encoding="utf-8")
+        claim_time = datetime(2026, 4, 20, 20, 0, tzinfo=timezone.utc)
+        handle = claim_work_request(
+            do_work_root,
+            request_path=request_path,
+            session_id="session-dead",
+            operation="work",
+            now=claim_time,
+        )
+        write_session_record(
+            do_work_root / ".sessions" / "session-dead.json",
+            SessionRecord(
+                session_id="session-dead",
+                hostname="local-host",
+                pid=4321,
+                started_at="2026-04-20T20:00:00Z",
+                last_heartbeat="2026-04-20T20:00:00Z",
+                operation="work",
+            ),
+        )
+
+        with mock.patch("lib.concurrency.socket.gethostname", return_value="local-host"):
+            with mock.patch("lib.concurrency._pid_alive", return_value=False):
+                inspection = inspect_work_claim_recovery(
+                    do_work_root,
+                    claim_path=handle.claim_path,
+                    now=claim_time + timedelta(minutes=5),
+                )
+
+        self.assertEqual(inspection.verdict, "recoverable")
+        self.assertFalse(inspection.process_alive)
+
+    def test_recover_orphaned_work_claim_moves_request_back_to_queue_and_logs(self) -> None:
+        do_work_root = self.root / "do-work"
+        request_path = do_work_root / "REQ-005-recover-me.md"
+        request_path.parent.mkdir(parents=True, exist_ok=True)
+        request_path.write_text("queued\n", encoding="utf-8")
+        claim_time = datetime(2026, 4, 20, 20, 0, tzinfo=timezone.utc)
+        handle = claim_work_request(
+            do_work_root,
+            request_path=request_path,
+            session_id="session-dead",
+            operation="work",
+            now=claim_time,
+        )
+        write_session_record(
+            do_work_root / ".sessions" / "session-dead.json",
+            SessionRecord(
+                session_id="session-dead",
+                hostname="local-host",
+                pid=4321,
+                started_at="2026-04-20T20:00:00Z",
+                last_heartbeat="2026-04-20T20:00:00Z",
+                operation="work",
+            ),
+        )
+
+        with mock.patch("lib.concurrency.socket.gethostname", return_value="local-host"):
+            with mock.patch("lib.concurrency._pid_alive", return_value=False):
+                result = recover_orphaned_work_claim(
+                    do_work_root,
+                    claim_path=handle.claim_path,
+                    recovering_session_id="session-rescuer",
+                    now=claim_time + timedelta(minutes=5),
+                )
+
+        self.assertEqual(result.claim_id, "REQ-005")
+        self.assertTrue((do_work_root / "REQ-005-recover-me.md").exists())
+        self.assertFalse((do_work_root / "working" / "REQ-005-recover-me.md").exists())
+        self.assertFalse(Path(handle.claim_path).exists())
+        self.assertFalse((do_work_root / ".sessions" / "session-dead.json").exists())
+        log = json.loads(Path(result.log_path).read_text(encoding="utf-8"))
+        self.assertEqual(log["claim_id"], "REQ-005")
+        self.assertEqual(log["released_session_id"], "session-dead")
+        self.assertEqual(log["recovered_by_session_id"], "session-rescuer")
+
+    def test_recover_orphaned_work_claim_rejects_ambiguous_recovery(self) -> None:
+        do_work_root = self.root / "do-work"
+        request_path = do_work_root / "REQ-005-ambiguous.md"
+        request_path.parent.mkdir(parents=True, exist_ok=True)
+        request_path.write_text("queued\n", encoding="utf-8")
+        claim_time = datetime(2026, 4, 20, 20, 0, tzinfo=timezone.utc)
+        handle = claim_work_request(
+            do_work_root,
+            request_path=request_path,
+            session_id="session-liveish",
+            operation="work",
+            now=claim_time,
+        )
+        write_session_record(
+            do_work_root / ".sessions" / "session-liveish.json",
+            SessionRecord(
+                session_id="session-liveish",
+                hostname="local-host",
+                pid=1234,
+                started_at="2026-04-20T20:00:00Z",
+                last_heartbeat="2026-04-20T20:00:00Z",
+                operation="work",
+            ),
+        )
+
+        with mock.patch("lib.concurrency.socket.gethostname", return_value="local-host"):
+            with mock.patch("lib.concurrency._pid_alive", return_value=True):
+                with self.assertRaises(RecoveryNotAllowedError):
+                    recover_orphaned_work_claim(
+                        do_work_root,
+                        claim_path=handle.claim_path,
+                        recovering_session_id="session-rescuer",
+                        now=claim_time + timedelta(minutes=5),
+                    )
+
+        self.assertTrue(Path(handle.claim_path).exists())
+        self.assertTrue((do_work_root / "working" / "REQ-005-ambiguous.md").exists())
 
     def test_claim_schema_rejects_unknown_scope(self) -> None:
         path = self.root / "claims" / "bad.json"

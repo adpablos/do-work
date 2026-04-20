@@ -146,6 +146,31 @@ Cross-host cases (`info.hostname != local hostname`) always return `stale` — U
 
 Claim lifecycle (when to create, refresh, release) is **not** defined here — that is per-action policy (REQ-004/REQ-007/REQ-009).
 
+### 6.5 Session Record + Explicit Recovery Helpers
+
+**Contract:** REQ-005's orphan recovery is explicit, evidence-based, and filesystem-visible. The library provides read/write helpers for session records plus an inspection/recovery API for work claims. The action decides when to call them (`do work resume`), but the library enforces the "no guessing" rule.
+
+**Session record API:**
+
+- `write_session_record(path, record)` — backed by `atomic_write`.
+- `read_session_record(path) -> SessionRecord`
+- `inspect_session_record(do_work_root, session_id) -> SessionRecord | None`
+
+**Work-claim recovery API:**
+
+- `inspect_work_claim_recovery(do_work_root, *, claim_path, now=None, stale_threshold=timedelta(minutes=2)) -> WorkClaimRecoveryInspection`
+- `recover_orphaned_work_claim(do_work_root, *, claim_path, recovering_session_id, now=None, stale_threshold=timedelta(minutes=2)) -> RecoveredWorkClaim`
+
+**Inspection verdicts:**
+
+- `live` — claim heartbeat is still fresh; recovery is not allowed.
+- `stale` — the claim is stale but the owning session still looks active or ambiguous (fresh session heartbeat, live PID, or conflicting evidence).
+- `foreign-host` — the session record names a different hostname; recovery is not allowed on this machine.
+- `missing-session-record` — the claim is stale but the originating session record is gone, so process absence cannot be proven.
+- `recoverable` — claim heartbeat stale, session heartbeat stale, hostname matches, and PID absent on the current host.
+
+`recover_orphaned_work_claim(...)` is intentionally narrow: it moves the REQ from `working/` back to the queue, writes a JSON log entry into `do-work/.recovery-log/`, removes the `.claim.json` sidecar, and deletes the originating session record. It raises `RecoveryNotAllowedError` if the evidence is anything other than `recoverable`.
+
 ### 7. Standard Lock Scopes
 
 **Canonical catalog.** Scope names are canonical and typed. Ad-hoc scope strings are rejected by `acquire_lock` via `ScopeError`. New scopes must be added to this document **and** to `SCOPES` in `lib/concurrency.py` before they can be used in action code.
@@ -189,12 +214,14 @@ All raised from `lib.concurrency`:
 
 - `LockHeldError` — second acquire on a live lock.
 - `ClaimFormatError` — invalid claim JSON or missing fields.
+- `SessionFormatError` — invalid session-record JSON or missing fields.
 - `ScopeError` — unknown scope name.
 - `ForeignReleaseError` — a lock handle no longer matches the on-disk lockfile.
 - `StaleRenameError` — `ENOENT` during rename (source vanished).
 - `CrossDeviceError` — `EXDEV` during rename (not same filesystem).
 - `CollisionError` — destination already exists for `atomic_rename`.
 - `AtomicWriteError` — I/O failure during `atomic_write` (disk full, permissions, etc.).
+- `RecoveryNotAllowedError` — orphan recovery was attempted without unequivocal evidence.
 
 ## Debuggability Guarantee
 
@@ -203,6 +230,7 @@ A user troubleshooting the skill must be able to understand lock/claim state wit
 - `ls do-work/.locks/` reveals every held lock.
 - `cat do-work/.locks/<scope>.lock` reveals the holder.
 - `cat do-work/working/<something>.claim.json` reveals active claims (when REQ-004..REQ-009 land).
+- `cat do-work/.recovery-log/<timestamp>-REQ-XXX.json` reveals every explicit orphan recovery event.
 
 No binary formats. No hidden state outside the documented directories. No database.
 

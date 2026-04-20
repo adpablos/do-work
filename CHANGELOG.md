@@ -4,6 +4,15 @@ What's new, what's better, what's different. Most recent stuff on top.
 
 ---
 
+## 0.17.0 — The Rescue Rope (2026-04-20)
+
+Stranded work no longer gets guessed back into the queue. `do work resume` now has a real recovery path: it only frees a REQ when the claim heartbeat is stale, the owning session is stale too, and the original PID is gone on this host. Everything else stays loud and visible instead of being "helpfully" stolen.
+
+- Added explicit orphan-recovery helpers to `lib/concurrency.py`, including recovery inspection, session-record parsing, on-disk recovery logs, and claim/session cleanup
+- Added recovery-focused concurrency tests for missing session records, foreign-host claims, ambiguous live-PID cases, and successful orphan recovery
+- Rewrote `actions/work.md` so normal `do work` never auto-recovers and `do work resume` is now the single explicit recovery workflow with breadcrumb requirements
+- Updated the concurrency-primitives contract to document the new recovery API surface and fail-loud behavior
+
 ## 0.16.0 — The Bouncer (2026-04-20)
 
 Work claims are now atomic and single-winner. Two sessions racing for the same REQ can no longer both move it into `working/` — one wins, the other gets a clear error naming the holder. Under the hood, claiming writes an `O_EXCL` sidecar `.claim.json` next to the REQ and only then renames the REQ into place; a failed rename rolls the sidecar back cleanly.

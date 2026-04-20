@@ -296,7 +296,7 @@ Marking Step 4.5 as done means `## Plan Verification` is written to the request 
 
 If no request files found, report completion and exit.
 
-**Do not auto-recover claims here.** Anything already in `do-work/working/` is presumed live until REQ-005 lands. No timestamp-based "unclaim after 1 hour", no forced resume path, no guessing. This action only claims files that are still in the root queue.
+**Do not auto-recover claims here.** Anything already in `do-work/working/` is presumed live during the normal `do work` loop. Recovery is a separate explicit path (`do work resume`) because the claim attempt itself must never guess about liveness. This action only claims files that are still in the root queue.
 
 ### Step 2: Claim the Request
 
@@ -948,7 +948,7 @@ release_claim(
 
 2. **Reset non-terminal work fields** (`status: pending`; remove `claimed_at`, `route`, `completed_at`, `commit`, and any transient error field that only described this aborted attempt).
 
-3. **If the state is ambiguous, fail loud instead of guessing.** Example: if the REQ file move succeeded but the rollback target is occupied, stop and tell the user exactly what is stranded in `working/`. Do not auto-merge or auto-recover here; REQ-005 owns recovery policy.
+3. **If the state is ambiguous, fail loud instead of guessing.** Example: if the REQ file move succeeded but the rollback target is occupied, stop and tell the user exactly what is stranded in `working/`. Do not auto-merge or auto-recover here; use the explicit `do work resume` flow below.
 
 **On terminal failure** (you intentionally record `status: failed` as the final outcome for this REQ) - do ALL of these steps:
 
@@ -1186,13 +1186,107 @@ Completed.
 - Report clearly what happened
 - Leave queue state intact for manual recovery
 
+## Explicit Recovery Path
+
+### `do work resume`
+
+`resume` is the **only** work-action path allowed to recover orphaned REQ claims. It never runs implicitly inside Step 1 or Step 2 of the normal work loop, and it never trusts age alone.
+
+The recovery rule is strict:
+
+- **Recover only when both signals agree**:
+  - the claim heartbeat is stale, and
+  - the owning session record is also stale **and** its PID is absent on the current host
+- **Fail loud on every ambiguity**:
+  - session record missing
+  - hostname mismatch
+  - PID still alive
+  - conflicting or inconsistent heartbeat evidence
+
+If any claim in `do-work/working/` is ambiguous, stop and surface the evidence. Do not partially "clean things up" and keep going.
+
+#### Resume workflow
+
+1. Establish session identity per `actions/session-identity.md`.
+2. List `do-work/working/*.claim.json`. If none exist, report "nothing to recover" and exit.
+3. Inspect every claim with the REQ-005 helper:
+
+```python
+from lib.concurrency import inspect_work_claim_recovery
+
+inspection = inspect_work_claim_recovery(
+    "do-work",
+    claim_path="do-work/working/REQ-XXX-slug.claim.json",
+)
+```
+
+4. Treat verdicts as follows:
+   - `live` → stop; the claim is still active.
+   - `stale` → stop; the heartbeat is stale but the process evidence is ambiguous, so recovery would guess.
+   - `foreign-host` → stop; this filesystem may be shared with another machine, and recovery is not allowed here.
+   - `missing-session-record` → stop; without the session record, recovery cannot prove process absence.
+   - `recoverable` → eligible for explicit recovery.
+5. If **any** claim is not `recoverable`, print the inspection evidence verbatim and halt without mutating anything.
+6. If **all** claims are `recoverable`, recover them one by one:
+
+```python
+from lib.concurrency import recover_orphaned_work_claim
+
+result = recover_orphaned_work_claim(
+    "do-work",
+    claim_path="do-work/working/REQ-XXX-slug.claim.json",
+    recovering_session_id="<current-session-id>",
+)
+```
+
+This helper does four things atomically enough for the explicit recovery path:
+
+- moves the REQ from `do-work/working/` back to the root queue
+- writes a recovery log entry to `do-work/.recovery-log/<timestamp>-REQ-XXX.json`
+- removes the `.claim.json` sidecar
+- deletes the originating session record in `do-work/.sessions/`
+
+7. After each successful recovery, update the REQ frontmatter in the returned queue file with breadcrumbs:
+
+```yaml
+---
+status: pending
+recovered_from_session: 2026-04-18T00-21-52Z-f2d85402
+recovered_at: 2026-04-18T00:40:00Z
+recovered_last_heartbeat: 2026-04-18T00:22:00Z
+recovery_note: "Recovered from stale heartbeat + absent PID on same host. Prior work may be partial."
+---
+```
+
+Use the values returned by `recover_orphaned_work_claim(...)`. Do **not** erase earlier workflow sections that may already be present in the REQ body; the next session needs to see the partial history.
+
+8. Surface the recovery log path(s) to the user. Recovery must be obvious on disk:
+
+```json
+{
+  "recovered_at": "2026-04-18T00:40:00Z",
+  "claim_id": "REQ-005",
+  "released_session_id": "2026-04-18T00-21-52Z-f2d85402",
+  "recovered_by_session_id": "2026-04-18T00-39-10Z-1a2b3c4d",
+  "claim_path": "do-work/working/REQ-005-evidence-based-orphan-recovery.claim.json",
+  "working_request_path": "do-work/working/REQ-005-evidence-based-orphan-recovery.md",
+  "queue_request_path": "do-work/REQ-005-evidence-based-orphan-recovery.md",
+  "evidence": {
+    "verdict": "recoverable",
+    "reason": "claim heartbeat is stale, the owning session heartbeat is stale, and the owning PID is absent on this host"
+  }
+}
+```
+
+9. Only after the explicit recovery pass finishes cleanly may the operator run the normal `do work` loop again.
+
 ## Commands
 
 ### `do work`
-Process all pending requests in order. Claims are atomic and session-bound. This command does **not** auto-unclaim anything already in `working/`; live/stale/orphan decisions are deferred to REQ-005.
+Process all pending requests in order. Claims are atomic and session-bound. This command does **not** auto-recover anything already in `working/`; use `do work resume` when recovery evidence needs to be checked explicitly.
 
 ### `do work resume`
-Reserved for the future orphan-recovery flow. Until REQ-005 lands, `resume` must not force-unclaim requests or trust age alone. If a request is stranded in `working/`, surface the claim/session evidence and stop.
+Inspect every claimed REQ in `do-work/working/` and recover only the unequivocal orphans: stale claim heartbeat, stale session heartbeat, same host, and absent PID. Any ambiguity halts the resume pass and surfaces the evidence instead of guessing.
 
 ### `do work REQ-005` (future enhancement)
 Process a specific request by number, regardless of status.
