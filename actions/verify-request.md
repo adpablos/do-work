@@ -55,6 +55,40 @@ If verify-request is running as Step 5.5 inside the do action, session identity 
 2. Check `do-work/`, `do-work/working/`, and `do-work/archive/` for each
 3. Read the full content of each REQ file
 
+### Step 3.5: Lock Each Target REQ For The Full Verify Cycle
+
+Before reading a REQ you intend to fix, take a per-document verify lock on **that REQ file** and hold it until the rewritten `## Verification` block has been persisted with atomic write-then-rename.
+
+- `verify-request` locks the REQ being updated, **not** the UR `input.md`. The UR is read-only during verification.
+- The lock is fail-fast. If another session already holds it, surface the error verbatim and stop verifying that REQ. Do not retry-loop or queue behind the holder.
+- Lock names must stay predictable for shell debugging. A REQ like `REQ-007-...md` maps to `do-work/.locks/verify-REQ-007.lock`.
+
+```python
+from pathlib import Path
+from lib.concurrency import (
+    acquire_verification_lock,
+    release_lock,
+    rewrite_markdown_section_atomic,
+)
+
+lock = acquire_verification_lock(
+    "do-work",
+    target_path="REQ-007-verify-document-locks.md",
+    session_id="<current-session-id>",
+    operation="verify-request",
+)
+try:
+    req_text = Path("do-work/REQ-007-verify-document-locks.md").read_text(encoding="utf-8")
+    # compute coverage + fixes while the lock is still held
+    rewrite_markdown_section_atomic(
+        "do-work/REQ-007-verify-document-locks.md",
+        heading="Verification",
+        new_section=rendered_verification_block,
+    )
+finally:
+    release_lock(lock)
+```
+
 ### Step 4: Enumerate Source Items
 
 Parse the UR's verbatim input into a numbered list of discrete items. Each item is independently verifiable:
@@ -111,7 +145,7 @@ For each missing or partial item:
 ### Step 8: Recalculate and Store
 
 1. **Recalculate coverage** after fixes (post-fix score)
-2. **Append a verification section** to each REQ file that was evaluated:
+2. **Replace or append the verification section atomically** for each REQ file that was evaluated. Do not hand-write the file in place; use the atomic write helper while the verify lock is still held:
 
 ```markdown
 ## Verification
@@ -169,4 +203,4 @@ For REQs created before the UR system:
 - Don't penalize REQs for missing details the user never mentioned
 - Don't treat implementation details as gaps -- those are for the builder to decide
 - Don't create new REQ files -- if coverage requires a new REQ, note the recommendation but let the do action handle it
-- Don't modify files in `working/` or `archive/` -- verification only updates REQ files in the `do-work/` queue
+- Don't bypass the per-document verify lock or write the `## Verification` block non-atomically

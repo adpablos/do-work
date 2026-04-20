@@ -749,7 +749,39 @@ For each missing or partial item, edit the appropriate REQ file directly:
 - Expand partial items with the missing detail
 - Don't invent requirements — only add what the user actually said
 
-**5. Store results — append to each REQ file:**
+Before touching any REQ file in this step, take the same per-document verify lock used by the manual verify actions and hold it for the entire read-compute-write cycle. Step 5.5 is not exempt just because it runs inside capture.
+
+```python
+from pathlib import Path
+from lib.concurrency import (
+    acquire_verification_lock,
+    release_lock,
+    rewrite_markdown_section_atomic,
+)
+
+lock = acquire_verification_lock(
+    "do-work",
+    target_path="REQ-007-verify-document-locks.md",
+    session_id="<current-session-id>",
+    operation="verify-request",
+)
+try:
+    req_text = Path("do-work/REQ-007-verify-document-locks.md").read_text(encoding="utf-8")
+    # compute coverage + fixes while the lock is still held
+    rewrite_markdown_section_atomic(
+        "do-work/REQ-007-verify-document-locks.md",
+        heading="Verification",
+        new_section=rendered_verification_block,
+    )
+finally:
+    release_lock(lock)
+```
+
+- No retry loops here. If another verification already holds `do-work/.locks/verify-REQ-NNN.lock`, fail loud and report the holder session.
+- The lock name must stay predictable for `ls` debugging, e.g. `do-work/.locks/verify-REQ-007.lock`.
+- Lock the REQ being rewritten, not the UR `input.md`.
+
+**5. Store results — rewrite the `## Verification` section atomically in each REQ file:**
 
 ```markdown
 ## Verification

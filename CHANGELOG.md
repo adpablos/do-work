@@ -4,6 +4,16 @@ What's new, what's better, what's different. Most recent stuff on top.
 
 ---
 
+## 0.21.0 — The Door Latch (2026-04-20)
+
+Verify runs stop stepping on each other now. A REQ under verification gets its own named document lock, the verification block rewrites atomically, and the loser in a race gets told exactly who is holding the file instead of quietly clobbering output.
+
+- Added verify-document helpers in `lib/concurrency.py` for predictable `verify-REQ-NNN.lock` naming, fail-fast verify locking, and atomic section replacement
+- Added regression coverage for the verify-request race plus helper-level checks around lock naming and markdown section replacement
+- Updated the verify-request, verify-plan, do-action Step 5.5, and concurrency-primitives docs so all verify flows follow the same lock protocol
+- Archived `REQ-007` as completed
+- Bumped the public skill version to `0.21.0`
+
 ## 0.20.0 — The Mop Guard (2026-04-20)
 
 Cleanup stopped freelancing. Only one cleanup run can hold the room at a time now, and if another session is already sweeping, you get told exactly who is holding the lock instead of wandering into a second pass.

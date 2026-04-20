@@ -849,6 +849,115 @@ def _session_record_path(do_work_root: PathLike, session_id: str) -> Path:
     return root / ".sessions" / f"{session_id}.json"
 
 
+def _verification_target_path(do_work_root: PathLike, target_path: PathLike) -> Path:
+    root = _coerce_do_work_root(do_work_root)
+    target = Path(os.fspath(target_path))
+    if target.is_absolute():
+        return target
+    return root / target
+
+
+def _verification_lock_identifier(target_path: Path) -> str:
+    req_number = _extract_identifier_number(target_path, "req")
+    if req_number is not None:
+        return _format_identifier("req", req_number)
+
+    if target_path.name == "input.md":
+        ur_number = _extract_identifier_number(target_path.parent, "ur")
+        if ur_number is not None:
+            return _format_identifier("ur", ur_number)
+
+    digest = hashlib.sha256(os.fspath(target_path).encode("utf-8")).hexdigest()[:12]
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", target_path.stem).strip("-")
+    if stem:
+        return f"{stem}-{digest}"
+    return f"doc-{digest}"
+
+
+def _verification_scope(do_work_root: PathLike, target_path: Path) -> str:
+    root = _coerce_do_work_root(do_work_root)
+    try:
+        scope_target = os.fspath(target_path.relative_to(root))
+    except ValueError:
+        scope_target = os.fspath(target_path)
+    return f"verify-doc:{scope_target}"
+
+
+def verification_lock_path(do_work_root: PathLike, *, target_path: PathLike) -> Path:
+    root = _coerce_do_work_root(do_work_root)
+    target = _verification_target_path(root, target_path)
+    identifier = _verification_lock_identifier(target)
+    return root / ".locks" / f"verify-{identifier}.lock"
+
+
+def acquire_verification_lock(
+    do_work_root: PathLike,
+    *,
+    target_path: PathLike,
+    session_id: str,
+    operation: str,
+    now: Optional[datetime] = None,
+) -> LockHandle:
+    if operation not in {"verify-request", "verify-plan"}:
+        raise ConcurrencyError(
+            "verification lock operation must be 'verify-request' or "
+            f"'verify-plan', got {operation!r}"
+        )
+
+    root = _coerce_do_work_root(do_work_root)
+    target = _verification_target_path(root, target_path)
+    return acquire_lock(
+        verification_lock_path(root, target_path=target),
+        session_id=session_id,
+        operation=operation,
+        scope=_verification_scope(root, target),
+        now=now,
+    )
+
+
+def replace_markdown_section(
+    document: str,
+    *,
+    heading: str,
+    new_section: str,
+) -> str:
+    expected_heading = f"## {heading}"
+    normalized = new_section.rstrip("\n") + "\n"
+    if not normalized.startswith(expected_heading):
+        raise ConcurrencyError(
+            f"replacement section must start with {expected_heading!r}"
+        )
+
+    pattern = re.compile(
+        rf"(?ms)^## {re.escape(heading)}\n.*?(?=^## |\Z)"
+    )
+    updated, count = pattern.subn(normalized, document, count=1)
+    if count:
+        return updated
+
+    stripped = document.rstrip("\n")
+    if not stripped:
+        return normalized
+    return stripped + "\n\n" + normalized
+
+
+def rewrite_markdown_section_atomic(
+    path: PathLike,
+    *,
+    heading: str,
+    new_section: str,
+) -> str:
+    target = Path(os.fspath(path))
+    current = target.read_text(encoding="utf-8")
+    updated = replace_markdown_section(
+        current,
+        heading=heading,
+        new_section=new_section,
+    )
+    atomic_write(target, updated)
+    return updated
+
+
 def _coerce_repo_root(path: PathLike) -> Path:
     return Path(os.fspath(path)).resolve()
 
@@ -2546,12 +2655,16 @@ __all__ = [
     "ScopedStageResult",
     "validate_scope",
     "acquire_lock",
+    "acquire_verification_lock",
     "release_lock",
     "inspect_lock",
     "refresh_heartbeat",
     "classify_lock",
     "atomic_rename",
     "atomic_write",
+    "verification_lock_path",
+    "replace_markdown_section",
+    "rewrite_markdown_section_atomic",
     "read_session_record",
     "write_session_record",
     "inspect_session_record",

@@ -161,7 +161,25 @@ Cross-host cases (`info.hostname != local hostname`) always return `stale` — U
 
 Claim lifecycle (when to create, refresh, release) is **not** defined here — that is per-action policy (REQ-004/REQ-007/REQ-009).
 
-### 6.1 Cleanup Claim + Global Lock
+### 6.1 Verify-Document Lock + Atomic Section Rewrite
+
+**Contract:** Verify flows lock the specific REQ they are rewriting for the entire read-compute-write cycle. The same helper is used by manual `verify-request`, manual `verify-plan`, and Step 5.5 auto-verify in the do action. Contention fails immediately with the holder session named in the error.
+
+**API:**
+
+- `verification_lock_path(do_work_root, *, target_path) -> Path`
+- `acquire_verification_lock(do_work_root, *, target_path, session_id, operation, now=None) -> LockHandle`
+- `replace_markdown_section(document, *, heading, new_section) -> str`
+- `rewrite_markdown_section_atomic(path, *, heading, new_section) -> str`
+
+**Behavior notes:**
+
+- `operation` must be `"verify-request"` or `"verify-plan"`.
+- Lock names are predictable for shell debugging: `REQ-007-...md` maps to `do-work/.locks/verify-REQ-007.lock`, `UR-001/input.md` maps to `do-work/.locks/verify-UR-001.lock`.
+- The lock scope carries the target document path (`verify-doc:<relative-target>`), so a `LockHeldError` names both the holder session and the document that is already under verification.
+- `rewrite_markdown_section_atomic(...)` uses the shared `atomic_write(...)` helper, so readers see either the old verification block or the new one — never a half-written file.
+
+### 6.2 Cleanup Claim + Global Lock
 
 **Contract:** Cleanup takes an exclusive global lock plus a lightweight heartbeat claim. The lock serializes scan/decision windows. The cleanup claim leaves a readable breadcrumb naming the active cleanup session even when the action is between re-scans.
 

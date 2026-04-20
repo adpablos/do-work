@@ -16,6 +16,7 @@ from lib.concurrency import (
     CleanupClaimHandle,
     CleanupClaimRecord,
     ConcurrencyError,
+    acquire_verification_lock,
     archive_completed_request,
     archive_legacy_context_if_complete,
     archive_user_request_if_complete,
@@ -60,11 +61,14 @@ from lib.concurrency import (
     release_claim,
     refresh_heartbeat,
     release_lock,
+    replace_markdown_section,
     SessionClaimConflictError,
     verify_and_stage_claim_scope,
+    verification_lock_path,
     write_session_record,
     write_claim,
     write_cleanup_claim,
+    rewrite_markdown_section_atomic,
 )
 
 
@@ -154,6 +158,42 @@ def _cleanup_claim_race_worker(
     result_queue.put(("acquired", session_id, handle.path))
     release_event.wait(timeout=2)
     release_cleanup(handle)
+
+
+def _verify_request_race_worker(
+    do_work_root: str,
+    target_path: str,
+    start_event,
+    release_event,
+    result_queue,
+) -> None:
+    start_event.wait()
+    session_id = f"session-{os.getpid()}"
+    try:
+        handle = acquire_verification_lock(
+            do_work_root,
+            target_path=target_path,
+            session_id=session_id,
+            operation="verify-request",
+        )
+    except LockHeldError as exc:
+        result_queue.put(("held", session_id, str(exc)))
+        return
+
+    try:
+        result_queue.put(("acquired", session_id, handle.path))
+        release_event.wait(timeout=2)
+        rewrite_markdown_section_atomic(
+            target_path,
+            heading="Verification",
+            new_section=(
+                "## Verification\n\n"
+                f"winner: {session_id}\n\n"
+                "*Verified by verify-request action*\n"
+            ),
+        )
+    finally:
+        release_lock(handle)
 
 
 class ConcurrencyPrimitivesTest(unittest.TestCase):
@@ -312,6 +352,40 @@ class ConcurrencyPrimitivesTest(unittest.TestCase):
         assert info is not None
         self.assertEqual(info.last_heartbeat, "2026-04-18T00:00:45Z")
         self.assertEqual(handle.info.last_heartbeat, "2026-04-18T00:00:45Z")
+
+    def test_verification_lock_path_uses_predictable_req_name(self) -> None:
+        do_work_root = self.root / "do-work"
+        lock_path = verification_lock_path(
+            do_work_root,
+            target_path=do_work_root / "REQ-007-verify-document-locks.md",
+        )
+
+        self.assertEqual(
+            lock_path,
+            do_work_root / ".locks" / "verify-REQ-007.lock",
+        )
+
+    def test_replace_markdown_section_appends_or_replaces_by_heading(self) -> None:
+        original = (
+            "# Request\n\n"
+            "## Plan\n\n"
+            "Plan text.\n\n"
+            "## Verification\n\n"
+            "Old verification.\n"
+        )
+
+        updated = replace_markdown_section(
+            original,
+            heading="Verification",
+            new_section=(
+                "## Verification\n\n"
+                "New verification.\n"
+            ),
+        )
+
+        self.assertIn("New verification.", updated)
+        self.assertNotIn("Old verification.", updated)
+        self.assertEqual(updated.count("## Verification"), 1)
 
     def test_release_lock_rejects_foreign_handle(self) -> None:
         path = self.root / "locks" / "foreign.lock"
@@ -1361,6 +1435,56 @@ class ConcurrencyPrimitivesTest(unittest.TestCase):
         self.assertFalse(queue_req.exists())
         self.assertTrue((self.root / "working" / "REQ-004-atomic-req-claim.md").exists())
         self.assertTrue((self.root / "working" / "REQ-004-atomic-req-claim.claim.json").exists())
+
+    def test_parallel_verify_request_locking_produces_one_winner_and_named_holder(self) -> None:
+        do_work_root = self.root / "do-work"
+        do_work_root.mkdir(parents=True, exist_ok=True)
+        target = do_work_root / "REQ-007-verify-document-locks.md"
+        target.write_text(
+            "# Verify Target\n\n"
+            "## Verification\n\n"
+            "Original verification.\n",
+            encoding="utf-8",
+        )
+
+        ctx = multiprocessing.get_context("spawn")
+        start_event = ctx.Event()
+        release_event = ctx.Event()
+        result_queue = ctx.Queue()
+        processes = [
+            ctx.Process(
+                target=_verify_request_race_worker,
+                args=(str(do_work_root), str(target), start_event, release_event, result_queue),
+            )
+            for _ in range(2)
+        ]
+
+        for process in processes:
+            process.start()
+
+        start_event.set()
+        results = [result_queue.get(timeout=5) for _ in range(2)]
+        release_event.set()
+
+        for process in processes:
+            process.join(timeout=5)
+            self.assertEqual(process.exitcode, 0)
+
+        acquired = [result for result in results if result[0] == "acquired"]
+        held = [result for result in results if result[0] == "held"]
+        self.assertEqual(len(acquired), 1)
+        self.assertEqual(len(held), 1)
+
+        winner_session = acquired[0][1]
+        held_message = held[0][2]
+        self.assertIn(winner_session, held_message)
+        self.assertIn("REQ-007-verify-document-locks.md", held_message)
+        self.assertIn("verify-REQ-007.lock", held_message)
+        self.assertFalse((do_work_root / ".locks" / "verify-REQ-007.lock").exists())
+        self.assertIn(
+            f"winner: {winner_session}",
+            target.read_text(encoding="utf-8"),
+        )
 
     def test_archive_completed_request_closes_ur_when_last_req_finishes(self) -> None:
         working_dir = self.root / "working"
