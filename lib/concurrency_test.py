@@ -1619,6 +1619,69 @@ class ConcurrencyPrimitivesTest(unittest.TestCase):
         self.assertIn("src/foreign.py", message)
         self.assertIn("session-1", message)
 
+    def test_verify_and_stage_claim_scope_rejects_staged_only_foreign_edit(self) -> None:
+        """Regression: a foreign change staged via `git add` then reverted in
+        the working tree (`git restore --worktree`) leaves the index dirty
+        but the working tree clean. _git_dirty_paths must check the staged
+        diff too, otherwise the staged change slips into the scoped commit
+        silently."""
+        self._init_git_repo()
+        (self.root / "do-work").mkdir(parents=True, exist_ok=True)
+        (self.root / "src").mkdir(parents=True, exist_ok=True)
+        queue_req = self.root / "do-work" / "REQ-010-foreign-edit-detection.md"
+        queue_req.write_text("payload\n", encoding="utf-8")
+        (self.root / "src" / "owned.py").write_text("print('owned')\n", encoding="utf-8")
+        (self.root / "src" / "foreign.py").write_text("print('foreign')\n", encoding="utf-8")
+        self._git(
+            "add",
+            "do-work/REQ-010-foreign-edit-detection.md",
+            "src/owned.py",
+            "src/foreign.py",
+        )
+        self._git("commit", "-m", "baseline")
+
+        handle = claim_work_request(
+            self.root / "do-work",
+            request_path="REQ-010-foreign-edit-detection.md",
+            session_id="session-1",
+            operation="work",
+            repo_root=self.root,
+            now=datetime(2026, 4, 21, 12, 0, tzinfo=timezone.utc),
+        )
+
+        capture_claim_tree_state(
+            self.root,
+            claim_handle_or_path=handle,
+            scope_paths=(
+                "src/owned.py",
+                handle.request_path,
+            ),
+            expected_session_id="session-1",
+        )
+
+        # Foreign session: stage a change to foreign.py, then revert the
+        # working tree only (leaving the index dirty). Pre-fix, this
+        # state was invisible to verify_and_stage_claim_scope and the
+        # staged change would be included in the scoped commit.
+        (self.root / "src" / "foreign.py").write_text(
+            "print('foreign staged')\n", encoding="utf-8"
+        )
+        self._git("add", "src/foreign.py")
+        self._git("restore", "--worktree", "src/foreign.py")
+
+        with self.assertRaises(TreeStateViolationError) as ctx:
+            verify_and_stage_claim_scope(
+                self.root,
+                claim_handle_or_path=handle,
+                current_request_path=handle.request_path,
+                expected_session_id="session-1",
+                now=datetime(2026, 4, 21, 12, 1, tzinfo=timezone.utc),
+            )
+
+        message = str(ctx.exception)
+        self.assertIn("foreign changes detected", message)
+        self.assertIn("src/foreign.py", message)
+
     def test_verify_and_stage_claim_scope_stages_only_snapshot_paths(self) -> None:
         self._init_git_repo()
         (self.root / "do-work").mkdir(parents=True, exist_ok=True)

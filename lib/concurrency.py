@@ -1337,9 +1337,24 @@ def _normalize_repo_relative_path(repo_root: PathLike, path: PathLike) -> str:
 
 
 def _git_dirty_paths(repo_root: PathLike) -> tuple[str, ...]:
-    tracked = {
+    # Three sources, all unioned, because each can hide a foreign edit:
+    # - working-tree diff vs HEAD: normal "I edited a file" case.
+    # - staged-only diff vs HEAD: a foreign session ran `git add` on a file
+    #   and then reverted the working tree (e.g. `git restore --worktree`).
+    #   The working-tree diff is empty but the index still carries the
+    #   change; without this query, the change would slip into our scoped
+    #   commit silently.
+    # - untracked files: anything not yet known to git.
+    tracked_working = {
         line.strip()
         for line in _run_git(repo_root, "diff", "--name-only", "HEAD", "--").splitlines()
+        if line.strip()
+    }
+    tracked_staged = {
+        line.strip()
+        for line in _run_git(
+            repo_root, "diff", "--cached", "--name-only", "HEAD", "--"
+        ).splitlines()
         if line.strip()
     }
     untracked = {
@@ -1352,7 +1367,7 @@ def _git_dirty_paths(repo_root: PathLike) -> tuple[str, ...]:
         ).splitlines()
         if line.strip()
     }
-    return tuple(sorted(tracked | untracked))
+    return tuple(sorted(tracked_working | tracked_staged | untracked))
 
 
 def _sha256_file(path: Path) -> str:
