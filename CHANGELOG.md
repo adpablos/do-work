@@ -4,6 +4,25 @@ What's new, what's better, what's different. Most recent stuff on top.
 
 ---
 
+## 0.14.0 — The Parallel Pact (2026-04-21)
+
+`do-work` now runs safely under concurrent sessions. The whole of UR-001 lands as one release: session identity + heartbeat, shared coordination primitives, atomic IDs and claims, evidence-based orphan recovery, atomic archival and cleanup, per-document verify locks, capture atomicity with rollback, and scoped commits that refuse to absorb foreign edits. The filesystem is still the source of truth — no new runtime dependencies, stdlib-only.
+
+- **Foundation**: new `actions/session-identity.md` (session ID + heartbeat on disk), plus `lib/concurrency.py` + `actions/concurrency-primitives.md` for O_EXCL lockfiles, atomic rename, atomic writes, and a shared claim schema.
+- **Atomic allocation**: REQ and UR IDs mint under short namespace locks; parallel captures can no longer collide.
+- **Atomic claims**: work action writes an `O_EXCL` `.claim.json` sidecar before moving a REQ into `working/`. One claim per REQ, one claim per session. The loser in a race sees a clear error naming the holder.
+- **Evidence-based recovery**: `do work resume` is now the only explicit recovery path. A claim is freed only when the heartbeat is stale AND the owning session is stale AND the PID is gone on the current host. Pure TTL recovery is gone; ambiguous cases surface and halt.
+- **Atomic archival + cleanup**: per-UR locks for the final-REQ archive; global short lock for `do work cleanup`. No folder-move races, no silent duplicates.
+- **Verify document locks**: verify-request, verify-plan, and Step 5.5 all take predictable per-document locks (`verify-REQ-NNN.lock`) and rewrite the `## Verification` section atomically. Fail-fast, no retry loops.
+- **Capture atomicity**: staged UR + REQ writes under a manifest; publish is resumable after a mid-commit crash; abort preserves the verbatim draft by default; IDs stay reserved while a partial draft exists.
+- **Foreign-edit detection**: claim-time snapshot of the tree and HEAD; commit-time scoped staging replaces `git add -A`; any foreign edit outside the frozen scope halts the commit with an actionable error.
+- **60 tests** including a 20-process race proving exactly one winner per scope. Run with `python3 -m unittest lib.concurrency_test`.
+- **Removed**: the 1-hour TTL auto-unclaim in `actions/work.md`. Pure-timestamp recovery is incompatible with the new claim model and is replaced by the evidence-based path above.
+- **First dogfood**: the PRD lived briefly as a draft in `docs/prd/`, was captured into UR-001 by `do work` itself (the draft is gone — the UR is now canonical), split into REQ-001..REQ-010, and each REQ was executed through `do work run` to produce the commits in this release. See `do-work/archive/UR-001/` for per-REQ implementation notes preserved as living logs.
+- **Post-review polish**: `abort_capture_transaction` can no longer split-brain a committing transaction regardless of `preserve_draft`; `atomic_rename` docstring reflects its TOCTOU contract honestly (callers serialize via locks); `DEFAULT_STALE_THRESHOLD` consolidated as a module constant so `actions/session-identity.md` stays the single source of truth; `.capture-staging/` and `.claims/` added to `.gitignore`; `recover_orphaned_work_claim` surfaces an actionable message if it can't release the claim sidecar after the REQ is already back in the queue; `_git_dirty_paths` also unions `git diff --cached --name-only HEAD` so a foreign edit staged via `git add` and then reverted in the working tree is no longer invisible to `verify_and_stage_claim_scope`; `abort_capture_transaction(preserve_draft=True)` and `repair_capture_state` now document the "preserved-then-discarded" contract explicitly (the flag delays deletion until the next repair call, not forever), and `repair_capture_state` surfaces a distinct detail string when it drops a preserved draft so operators can see the preservation flag was honored and then released.
+
+---
+
 ## 0.13.2 — The Hall of Mirrors (2026-04-17)
 
 Dogfooding the skill on itself has its own hazards — the code you're editing is the code that's running. Added a "meta-use" section to `docs/prd/README.md` with guardrails for when the PRD targets `do-work` itself.
@@ -228,4 +247,3 @@ The beginning. Core task capture and processing system with do/work routing, REQ
 - Work loop processing with `do work run`
 - REQ file lifecycle: pending → working → archived
 - Git-aware: auto-commits after each completed request
-

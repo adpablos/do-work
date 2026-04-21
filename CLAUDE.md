@@ -1,19 +1,37 @@
 # Do-Work Skill Project
 
-## Before Every Commit
+## Versioning and Changelog
 
-**Always bump the version in `actions/version.md` before committing.**
+The version on `main` is the version users actually get via `npx skills add`. It reflects **releases**, not intermediate commits. Version bumps and changelog entries happen at release time, not per commit on a feature branch.
 
-The version is on the line that starts with `**Current version**:` - increment it using semver:
+### Semver
+
 - Patch (0.1.0 → 0.1.1): Bug fixes, minor tweaks
 - Minor (0.1.0 → 0.2.0): New features, behavior changes
 - Major (0.1.0 → 1.0.0): Breaking changes
 
 When in doubt, bump the patch version.
 
-**Immediately after bumping the version, update `CHANGELOG.md`.**
+### On `main` directly (hotfixes, docs, small standalone changes)
 
-Add a new entry at the top of the file (below the header), following this format:
+One commit = one release. Before committing:
+
+1. Bump the version in `actions/version.md` (line starting with `**Current version**:`).
+2. Add a corresponding entry at the top of `CHANGELOG.md` (format below).
+3. Commit.
+
+### On feature / `prd/` branches (the usual workflow for anything non-trivial)
+
+Follow the [Keep a Changelog](https://keepachangelog.com) `[Unreleased]` pattern:
+
+1. **Do not touch `actions/version.md`** during normal commits on the branch.
+2. **Do not add versioned entries to `CHANGELOG.md`** during normal commits. Instead, accumulate bullets under a `## [Unreleased]` section at the top of the file. Each commit that introduces user-visible change adds to that section.
+3. Review-feedback commits on an open PR don't need new bullets unless they change behavior.
+4. When the PR is ready to merge: a **single final commit on the branch** promotes `## [Unreleased]` to `## X.Y.Z — [Name] (YYYY-MM-DD)`, bumps `actions/version.md` once, and becomes the release commit.
+
+This keeps the version from inflating while a branch is under review, avoids merge conflicts between parallel branches on the version line, and ensures each number on `main` corresponds to something users actually received.
+
+### Changelog entry format
 
 ```markdown
 ## X.Y.Z — The [Fun Two-Word Name] (YYYY-MM-DD)
@@ -23,14 +41,19 @@ Add a new entry at the top of the file (below the header), following this format
 - [Bullet points for specifics — what was added, changed, or fixed]
 ```
 
-Rules for changelog entries:
+Rules:
+
 - **Newest on top.** The file reads top-to-bottom as newest-to-oldest.
-- **Give every version a name.** A short, fun title after the em dash (e.g., "The Organizer", "Typo Patrol"). This isn't a novel — two or three words max.
-- **Date every entry.** Add the date in parentheses after the name, formatted as `(YYYY-MM-DD)`. Use today's date.
-- **Lead with the value, not the implementation.** Say what the user gets, not what files changed. "The archive tidies itself now" beats "added cleanup.md".
-- **Keep it brief.** One short paragraph + a few bullets. If you're writing more than 5 bullets, you're over-explaining.
-- **Match the voice.** Conversational, not corporate. Imagine you're telling a friend what shipped. No jargon walls, no passive voice marathons.
-- **Every version gets an entry.** No skipping. Even a patch fix deserves a line.
+- **Give every release a name.** A short, fun title after the em dash (e.g., "The Organizer", "Typo Patrol"). Two or three words max.
+- **Date every entry.** `(YYYY-MM-DD)`. Use the merge date.
+- **Lead with the value, not the implementation.** "The archive tidies itself now" beats "added cleanup.md".
+- **Keep it brief.** One short paragraph + a few bullets. If you're writing more than 5 bullets, you're over-explaining — unless it's a big release (e.g., a whole UR consolidated), in which case group bullets by theme.
+- **Match the voice.** Conversational, not corporate. Imagine you're telling a friend what shipped.
+- **Every release gets an entry.** No skipping.
+
+### Why this replaces the old "bump per commit" rule
+
+The old rule made sense when every commit hit `main` directly. Once work moved to feature branches with PR review, bumping per commit created inflated version numbers that never corresponded to a release (e.g., the parallel-safety branch accumulated eleven bumps 0.14.0 → 0.22.0, none of which users ever saw). The `[Unreleased]` pattern keeps branch work honest and makes the version on `main` mean something.
 
 ## Agent Compatibility
 

@@ -154,6 +154,7 @@ do-work/
 │   └── CONTEXT-002-old-batch.md   # Legacy context docs
 ├── working/                       # Currently being processed
 │   └── REQ-020-in-progress.md
+│   └── REQ-020-in-progress.claim.json
 └── archive/                       # Completed work
     ├── UR-001/                    # Archived as self-contained unit
     │   ├── input.md
@@ -170,7 +171,7 @@ do-work/
 
 - **Root `do-work/`**: The queue - ONLY pending `REQ-*.md` files live here
 - **`user-requests/`**: UR folders with verbatim input and assets per user request
-- **`working/`**: File moves here when claimed, prevents double-processing
+- **`working/`**: Claimed REQs live here alongside a `.claim.json` sidecar that names the owning session
 - **`archive/`**: Completed UR folders (self-contained units) AND legacy REQs/CONTEXT docs
 - **`assets/`**: Legacy screenshots and context documents (pre-UR system)
 
@@ -230,7 +231,7 @@ error: "Description of failure"  # Only if failed
 
 ```
 pending (in do-work/, set by do action)
-    → claimed (moved to working/, set by work action)
+    → claimed (moved to working/ with sidecar claim file, set by work action)
     → [planning] → [exploring] → implementing → testing
     → completed (moved to archive/)
     ↘ failed (moved to archive/ with error)
@@ -245,7 +246,7 @@ Brackets indicate optional phases based on route.
 The work action is an **orchestrator**. You (the orchestrator) are responsible for ALL file management operations. Spawned agents do implementation work but do NOT touch request files or folder structure.
 
 **You must do these yourself (not delegate to agents):**
-- Move request file to `working/` folder (Step 2)
+- Take the atomic work claim and move the request into `working/` (Step 2)
 - Update frontmatter status fields (Steps 2, 3, 7)
 - Write triage/plan/exploration/testing sections to the request file
 - Move request file to `archive/` folder (Step 7)
@@ -265,18 +266,22 @@ The work action is an **orchestrator**. You (the orchestrator) are responsible f
 
 ```
 Work order — [REQ-NNN]:
+[ ] Step 0.5: Establish session identity per actions/session-identity.md
 [ ] Step 1:   Identify next REQ-*.md in do-work/
-[ ] Step 2:   Claim → move to working/, update frontmatter (status: claimed)
+[ ] Step 2:   Atomic claim (`claim_work_request`) → move to working/, create sidecar claim, update frontmatter
 [ ] Step 3:   Triage → assign route A/B/C, append ## Triage section
 [ ] Step 4:   Plan → spawn Plan agent, append ## Plan section
 [ ] Step 4.5: *** MANDATORY *** Verify Plan → enumerate requirements, map to plan steps, fix gaps, append ## Plan Verification section
 [ ] Step 5:   Explore → spawn Explore agent OR append "Exploration: Not needed"
+[ ] Step 6:   Freeze claim scope snapshot → capture_claim_tree_state(...)
 [ ] Step 6:   Implement → spawn implementation agent, capture summary
 [ ] Step 6.5: Run tests → append ## Testing section
 [ ] Step 7:   Archive → update frontmatter, move file per UR/legacy logic
-[ ] Step 8:   Commit → git add -A && git commit (git repos only)
+[ ] Step 8:   Commit → verify_and_stage_claim_scope(...) && git commit (git repos only)
 [ ] Step 9:   Loop or exit
 ```
+
+Step 0.5 must be satisfied before any `do-work/` write. When the work action loops across multiple REQs in the same session, session identity is established once and refreshed via heartbeat — not re-established per REQ.
 
 Marking Step 4.5 as done means `## Plan Verification` is written to the request file. Marking Step 6.5 as done means `## Testing` is written to the request file. Checking a box without the artifact does not count.
 
@@ -292,15 +297,41 @@ Marking Step 4.5 as done means `## Plan Verification` is written to the request 
 
 If no request files found, report completion and exit.
 
-**Stale claim check:** Before picking from the queue, also check `do-work/working/`. If a file there has a `claimed_at` older than 1 hour, assume the previous session was interrupted — unclaim it (reset `status: pending`, remove `claimed_at` and `route`) and move it back to `do-work/` so it gets picked up normally. `do work resume` forces this behavior regardless of age.
+**Do not auto-recover claims here.** Anything already in `do-work/working/` is presumed live during the normal `do work` loop. Recovery is a separate explicit path (`do work resume`) because the claim attempt itself must never guess about liveness. This action only claims files that are still in the root queue.
 
 ### Step 2: Claim the Request
 
 **[Orchestrator action - do this yourself, BEFORE spawning any agents]**
 
+**Assumed working-tree state:** If this project is in Git, the work action assumes the tree is clean when the claim is taken. A dirty tree means another change is already in flight and this REQ cannot safely establish ownership of commit scope. In that case, fail loud and surface the dirty paths instead of guessing. The default policy is refuse-and-surface, not "warn and continue."
+
 1. Create `do-work/working/` folder if it doesn't exist
-2. Move the request file from `do-work/` to `do-work/working/`
-3. Update the frontmatter:
+2. Enforce **one work claim per session**:
+   - Before claiming a new REQ, check `do-work/working/*.claim.json` for a claim already owned by the current `session_id`
+   - If this session already owns one, resume or finish that REQ first. Do **not** claim a second request
+3. Attempt the claim with the REQ-004 helper:
+
+```python
+from lib.concurrency import claim_work_request
+
+claim = claim_work_request(
+    "do-work",
+    request_path="REQ-XXX-slug.md",
+    session_id="<current-session-id>",
+    operation="work",
+    repo_root=".",
+)
+```
+
+This helper is the policy boundary for REQ-004:
+- The claim point is an **exclusive-create** of `do-work/working/REQ-XXX-slug.claim.json`
+- On success, the queued REQ is immediately moved into `do-work/working/REQ-XXX-slug.md`
+- If the move fails, the helper removes the just-created claim before re-raising
+- If another session already won, the helper raises `ClaimHeldError` naming the winning session and heartbeat
+- In Git-backed projects, it snapshots claim-time tree state into the sidecar: current `HEAD`, any pre-existing dirty paths, and an initial scoped fingerprint for the claimed REQ file
+- In Git-backed projects, it refuses the claim if the tree is already dirty unless you intentionally opt into a different policy
+
+4. On successful claim, update the frontmatter in the moved REQ file:
 
 ```yaml
 ---
@@ -308,6 +339,67 @@ status: claimed
 claimed_at: 2025-01-26T10:30:00Z
 ---
 ```
+
+5. The claim sidecar must be `cat`-readable and use the shared claim schema:
+
+```json
+{
+  "claim_id": "REQ-004",
+  "session_id": "2026-04-18T00-21-52Z-f2d85402",
+  "operation": "work",
+  "scope": "req-claim:REQ-004",
+  "affected_paths": ["do-work/working/REQ-004-atomic-req-claim.md"],
+  "acquired_at": "2026-04-18T00:22:00Z",
+  "last_heartbeat": "2026-04-18T00:22:00Z",
+  "tree_state": {
+    "repo_root": "/repo",
+    "head_sha": "63477edd608c83afaddd6de04ae3f721c4f57954",
+    "captured_at": "2026-04-18T00:22:00Z",
+    "preexisting_dirty_paths": [],
+    "scope_paths": ["do-work/working/REQ-004-atomic-req-claim.md"],
+    "scope_fingerprints": [
+      {
+        "path": "do-work/working/REQ-004-atomic-req-claim.md",
+        "sha256": "..."
+      }
+    ]
+  }
+}
+```
+
+6. While the REQ remains claimed, refresh the claim heartbeat on the same cadence as the session heartbeat:
+
+```python
+from lib.concurrency import refresh_claim_heartbeat
+
+refresh_claim_heartbeat("do-work/working/REQ-XXX-slug.claim.json")
+```
+
+Refresh before and after any operation that might block for a long time.
+
+8. Once planning/exploration have named the implementation files, freeze the scoped commit snapshot before code changes begin:
+
+```python
+from lib.concurrency import capture_claim_tree_state
+
+capture_claim_tree_state(
+    ".",
+    claim_handle_or_path=claim,
+    scope_paths=[
+        "src/feature.py",
+        "tests/test_feature.py",
+    ],
+    expected_session_id="<current-session-id>",
+)
+```
+
+This rewrites only the claim's `tree_state.scope_paths` and file fingerprints. The original claim-time `HEAD` and pre-existing dirty-state snapshot stay intact.
+
+7. If `ClaimHeldError` is raised:
+   - Surface the error verbatim so the losing session can see who won
+   - Log the conflict in your progress output
+   - Pick a different queued REQ or exit cleanly
+   - Do **not** spin forever retrying the same claim
 
 ### Step 3: Triage
 
@@ -763,29 +855,33 @@ route: B
 mkdir -p do-work/archive
 ```
 
+**Claim release rule:** The `.claim.json` sidecar stays in place until the REQ has been transitioned out of `working/` **and** the commit-scope gate has finished. Never drop the claim first and then attempt the move. If archival succeeds but commit-time verification fails, keep the claim in place, surface the failure, and let the user resolve the tree state before retrying or rolling back.
+
+**REQ-002 note:** REQ-004 owns the queue → working transition. REQ-006 upgrades the archive step here to the same `atomic_rename(...)` discipline, with a short per-UR archival lock for the "last REQ finished" transition.
+
 4. **Archive the request file** — behavior depends on whether the REQ has a UR:
 
 **If REQ has `user_request: UR-NNN` (new system):**
-   - Read the UR's `input.md` from `do-work/user-requests/UR-NNN/`
-   - Check its `requests` array (e.g., `[REQ-018, REQ-019, REQ-020]`)
-   - Check if ALL listed REQs are now completed (in `do-work/working/` with `status: completed` or already in `archive/`)
-   - If **all REQs complete**:
-     - Move the completed REQ file into the UR folder: `mv do-work/working/REQ-XXX.md do-work/user-requests/UR-NNN/`
-     - Move any other completed REQs from `do-work/archive/` that belong to this UR into the UR folder
-     - Move the entire UR folder to archive: `mv do-work/user-requests/UR-NNN do-work/archive/`
-   - If **not all REQs complete**:
-     - Move the REQ file directly to archive for now: `mv do-work/working/REQ-XXX.md do-work/archive/`
-     - The UR folder stays in `user-requests/` until the last REQ completes, which triggers the full UR archive
+   - Call `archive_completed_request(do_work_root, working_request_path=..., session_id="<current-session-id>", operation="work")`
+   - That helper first atomically moves the REQ out of `working/` into `do-work/archive/`
+   - Then it takes a short per-UR lock (`ur-archival:UR-NNN`), re-reads the UR's `requests` array, and checks whether every listed REQ is already archived
+   - If **all REQs are already archived**, it gathers any loose `archive/REQ-*.md` files for that UR into the open UR folder and atomically renames `do-work/user-requests/UR-NNN/` to `do-work/archive/UR-NNN/`
+   - If another session already finished that UR archival, the helper returns a clean `already-archived` outcome — no error, no second move attempt
+   - If not all REQs are archived yet, the helper leaves the REQ in `do-work/archive/` root for now and returns `not-ready`
+   - **Important:** "final REQ" means "final REQ already archived", not merely `status: completed` in `working/`. The last-one-standing decision happens after this REQ's own archive move
+   - Do **not** release the sidecar claim yet; Step 8 still needs the snapshot for commit-time re-verification
 
 **If REQ has `context_ref` (legacy system):**
-   - Move REQ to archive: `mv do-work/working/REQ-XXX.md do-work/archive/`
-   - Read the CONTEXT document from `do-work/assets/`
-   - Check its `requests` array
-   - If ALL listed REQs are now in `do-work/archive/`: move the CONTEXT doc to archive too
-   - If not: leave CONTEXT doc in `assets/`
+   - Call the same `archive_completed_request(...)` helper
+   - The helper moves the REQ into `do-work/archive/`, then takes a short `ur-archival:<context-id>` lock for the shared CONTEXT document
+   - If all listed REQs are already archived, it atomically renames the CONTEXT file from `do-work/assets/` into `do-work/archive/`
+   - If another session already moved that CONTEXT file, the helper returns `already-archived` cleanly
+   - Do **not** release the sidecar claim yet; Step 8 still needs the snapshot for commit-time re-verification
 
 **If REQ has neither `user_request` nor `context_ref` (standalone legacy):**
-   - Move directly to archive: `mv do-work/working/REQ-XXX.md do-work/archive/`
+   - Call `archive_completed_request(...)`
+   - The helper performs the single atomic rename from `do-work/working/REQ-XXX.md` to `do-work/archive/REQ-XXX.md`
+   - Do **not** release the sidecar claim yet; Step 8 still needs the snapshot for commit-time re-verification
 
 **Complete request file structure after archival:**
 
@@ -866,7 +962,28 @@ commit: a1b2c3d
 - `claimed_at` → `completed_at`: How long implementation took
 - Route + timestamps: Compare complexity vs actual time spent
 
-**On failure - do ALL of these steps:**
+**On abort before a terminal outcome is recorded** (user cancels, crash-safe rollback path, orchestration error before the REQ is intentionally marked `completed` or `failed`) - do ALL of these steps:
+
+1. **Move the REQ back to the queue root** so it can be retried later:
+```python
+from lib.concurrency import atomic_rename, release_claim
+
+atomic_rename(
+    "do-work/working/REQ-XXX-slug.md",
+    "do-work/REQ-XXX-slug.md",
+    transition="working->queue rollback for REQ-XXX",
+)
+release_claim(
+    "do-work/working/REQ-XXX-slug.claim.json",
+    expected_session_id="<current-session-id>",
+)
+```
+
+2. **Reset non-terminal work fields** (`status: pending`; remove `claimed_at`, `route`, `completed_at`, `commit`, and any transient error field that only described this aborted attempt).
+
+3. **If the state is ambiguous, fail loud instead of guessing.** Example: if the REQ file move succeeded but the rollback target is occupied, stop and tell the user exactly what is stranded in `working/`. Do not auto-merge or auto-recover here; use the explicit `do work resume` flow below.
+
+**On terminal failure** (you intentionally record `status: failed` as the final outcome for this REQ) - do ALL of these steps:
 
 1. **Update frontmatter with error** (in `do-work/working/`):
 ```yaml
@@ -889,7 +1006,15 @@ mv do-work/working/REQ-XXX-slug.md do-work/archive/
 ```
 Note: Failed REQs always go directly to `do-work/archive/`, NOT into UR folders. A failed REQ does not count as "complete" for UR archival purposes — the UR folder stays in `user-requests/` until all REQs succeed or the user explicitly archives.
 
-4. **Report the failure to the user**
+4. **Release the sidecar claim** only after the REQ has left `working/`:
+```python
+release_claim(
+    "do-work/working/REQ-XXX-slug.claim.json",
+    expected_session_id="<current-session-id>",
+)
+```
+
+5. **Report the failure to the user**
 
 ### Step 8: Commit Changes (Git repos only)
 
@@ -904,12 +1029,39 @@ git rev-parse --git-dir 2>/dev/null
 
 If this fails (not a Git repo), skip this step entirely.
 
-**Stage and commit (single operation):**
-```bash
-# Stage ALL current changes - code, request file, assets
-git add -A
+**Re-verify and stage only the claimed scope:**
+```python
+from lib.concurrency import verify_and_stage_claim_scope
 
-# Single commit with structured message
+verify_and_stage_claim_scope(
+    ".",
+    claim_handle_or_path="do-work/working/REQ-XXX-slug.claim.json",
+    current_request_path="do-work/archive/REQ-XXX-slug.md",
+    expected_session_id="<current-session-id>",
+)
+```
+
+This is the REQ-010 gate:
+- It re-checks that the claim heartbeat is still fresh enough to trust
+- It re-checks that `HEAD` still matches the claim-time snapshot
+- It refuses the commit if any dirty path exists outside the frozen claim scope
+- It stages only the scoped files from the snapshot plus the REQ's current archived path
+- It never uses `git add -A` or `git add .`
+
+If `verify_and_stage_claim_scope(...)` raises, stop. Surface the message verbatim. Do **not** auto-revert or "clean up" foreign changes on the user's behalf.
+
+**After the commit succeeds, release the claim sidecar:**
+```python
+from lib.concurrency import release_claim
+
+release_claim(
+    "do-work/working/REQ-XXX-slug.claim.json",
+    expected_session_id="<current-session-id>",
+)
+```
+
+**Commit after scoped staging:**
+```bash
 git commit -m "$(cat <<'EOF'
 [REQ-003] Dark Mode (Route C)
 
@@ -939,7 +1091,8 @@ If your platform standardizes co-author lines, use its preferred identity. For C
 
 **Important commit rules:**
 - **ONE commit per request** - do not analyze files individually or create multiple commits
-- **Stage everything** with `git add -A` - includes code changes, archived request file, and any assets
+- **Stage only the scoped snapshot** - code changes, tests, and the archived request file for this REQ
+- **Foreign changes halt the commit** - surface the named files and stop until the tree is clean again
 - **No pre-commit hook bypass** - if hooks fail, fix the issue and retry
 - **Failed requests get committed too** - the archived request with `status: failed` documents what was attempted
 
@@ -958,7 +1111,7 @@ After archiving and committing:
 2. If found: Report what was completed, then start Step 1 again
 3. If empty: **Run the cleanup action** (see [cleanup action](./cleanup.md)), then report final summary and exit
 
-The cleanup action consolidates the archive — closing any UR folders where all REQs are now complete, moving loose REQ files into their UR folders, and organizing legacy files. This catches any consolidation that was missed during individual request archival.
+The cleanup action consolidates the archive and organizes legacy files. REQ-006 keeps the work action on a short per-UR archival lock instead of sharing cleanup's global lock; REQ-009 therefore needs cleanup to re-scan between structural moves rather than assume its initial directory view stays fresh.
 
 This fresh check on each loop means newly added requests get picked up automatically.
 
@@ -970,7 +1123,8 @@ Use this checklist to ensure you don't skip critical steps:
 
 ```
 □ Step 1: List REQ-*.md files in do-work/, pick first one
-□ Step 2: mkdir -p do-work/working && mv do-work/REQ-XXX.md do-work/working/
+□ Step 2: Ensure this session does not already hold another work claim
+□ Step 2: claim_work_request(...) → creates do-work/working/REQ-XXX-slug.claim.json and moves REQ into working/
 □ Step 2: Update frontmatter: status: claimed, claimed_at: <timestamp>
 □ Step 3: Read request, decide route (A/B/C), update frontmatter with route
 □ Step 3: Append ## Triage section to request file (including Planning status)
@@ -978,21 +1132,26 @@ Use this checklist to ensure you don't skip critical steps:
 □ Step 4.5: Run verify-plan — enumerate, map, fix plan, store coverage
 □ Step 5: If plan indicates exploration needed: Spawn Explore agent, append ## Exploration section
 □ Step 5: If plan is fully specified: Append "Exploration: Not needed" section
+□ Step 6: Freeze the scoped commit snapshot with capture_claim_tree_state(...)
 □ Step 6: Spawn implementation agent
+□ Step 6: Refresh session + claim heartbeat around long-running operations
 □ Step 6.5: Run tests, append ## Testing section
 □ Step 7: Update frontmatter: status: completed, completed_at: <timestamp>
 □ Step 7: Append ## Implementation Summary section
-□ Step 7: Archive REQ (see UR vs legacy archival logic)
-□ Step 7: If user_request exists → check if all UR's REQs complete → move UR folder to archive/
-□ Step 7: If context_ref exists (legacy) → check if all related REQs archived → move CONTEXT to archive/
-□ Step 7: If neither → mv do-work/working/REQ-XXX.md do-work/archive/
-□ Step 8: git add -A && git commit (if git repo)
+□ Step 7: Archive REQ with archive_completed_request(...); keep the .claim.json sidecar for Step 8
+□ Step 7: If user_request exists → helper takes per-UR lock, re-checks archived REQs, and either archives the UR or returns not-ready/already-archived
+□ Step 7: If context_ref exists → helper takes the shared-parent archival lock and either archives the CONTEXT file or returns not-ready/already-archived
+□ Step 7: If neither → helper performs the single working→archive atomic rename
+□ Abort path: If orchestration aborts before a terminal outcome, move REQ back to queue and release the claim
+□ Step 8: verify_and_stage_claim_scope(...) stages only the frozen scope
+□ Step 8: git commit (if git repo)
+□ Step 8: release_claim(...) only after the commit succeeds
 □ Step 9: Check for more requests, loop or exit
 □ Step 9: If exiting: Run cleanup action (close completed URs, consolidate loose REQs)
 ```
 
 **Common mistakes to avoid:**
-- Spawning implementation agent without first moving file to `working/`
+- Spawning implementation agent before taking the atomic claim (`claim_work_request(...)`)
 - Completing implementation without moving file to `archive/`
 - Forgetting to update status in frontmatter
 - Letting agents handle file management (they shouldn't)
@@ -1000,6 +1159,7 @@ Use this checklist to ensure you don't skip critical steps:
 - Skipping verify-plan (it's mandatory for all routes unless user said "skip verification")
 - Forgetting to check/archive related UR folders or legacy context documents
 - Archiving a UR folder before all its REQs are complete
+- Reaching for `git add -A` instead of re-verifying and staging the frozen claim scope
 
 ---
 
@@ -1091,13 +1251,107 @@ Completed.
 - Report clearly what happened
 - Leave queue state intact for manual recovery
 
+## Explicit Recovery Path
+
+### `do work resume`
+
+`resume` is the **only** work-action path allowed to recover orphaned REQ claims. It never runs implicitly inside Step 1 or Step 2 of the normal work loop, and it never trusts age alone.
+
+The recovery rule is strict:
+
+- **Recover only when both signals agree**:
+  - the claim heartbeat is stale, and
+  - the owning session record is also stale **and** its PID is absent on the current host
+- **Fail loud on every ambiguity**:
+  - session record missing
+  - hostname mismatch
+  - PID still alive
+  - conflicting or inconsistent heartbeat evidence
+
+If any claim in `do-work/working/` is ambiguous, stop and surface the evidence. Do not partially "clean things up" and keep going.
+
+#### Resume workflow
+
+1. Establish session identity per `actions/session-identity.md`.
+2. List `do-work/working/*.claim.json`. If none exist, report "nothing to recover" and exit.
+3. Inspect every claim with the REQ-005 helper:
+
+```python
+from lib.concurrency import inspect_work_claim_recovery
+
+inspection = inspect_work_claim_recovery(
+    "do-work",
+    claim_path="do-work/working/REQ-XXX-slug.claim.json",
+)
+```
+
+4. Treat verdicts as follows:
+   - `live` → stop; the claim is still active.
+   - `stale` → stop; the heartbeat is stale but the process evidence is ambiguous, so recovery would guess.
+   - `foreign-host` → stop; this filesystem may be shared with another machine, and recovery is not allowed here.
+   - `missing-session-record` → stop; without the session record, recovery cannot prove process absence.
+   - `recoverable` → eligible for explicit recovery.
+5. If **any** claim is not `recoverable`, print the inspection evidence verbatim and halt without mutating anything.
+6. If **all** claims are `recoverable`, recover them one by one:
+
+```python
+from lib.concurrency import recover_orphaned_work_claim
+
+result = recover_orphaned_work_claim(
+    "do-work",
+    claim_path="do-work/working/REQ-XXX-slug.claim.json",
+    recovering_session_id="<current-session-id>",
+)
+```
+
+This helper does four things atomically enough for the explicit recovery path:
+
+- moves the REQ from `do-work/working/` back to the root queue
+- writes a recovery log entry to `do-work/.recovery-log/<timestamp>-REQ-XXX.json`
+- removes the `.claim.json` sidecar
+- deletes the originating session record in `do-work/.sessions/`
+
+7. After each successful recovery, update the REQ frontmatter in the returned queue file with breadcrumbs:
+
+```yaml
+---
+status: pending
+recovered_from_session: 2026-04-18T00-21-52Z-f2d85402
+recovered_at: 2026-04-18T00:40:00Z
+recovered_last_heartbeat: 2026-04-18T00:22:00Z
+recovery_note: "Recovered from stale heartbeat + absent PID on same host. Prior work may be partial."
+---
+```
+
+Use the values returned by `recover_orphaned_work_claim(...)`. Do **not** erase earlier workflow sections that may already be present in the REQ body; the next session needs to see the partial history.
+
+8. Surface the recovery log path(s) to the user. Recovery must be obvious on disk:
+
+```json
+{
+  "recovered_at": "2026-04-18T00:40:00Z",
+  "claim_id": "REQ-005",
+  "released_session_id": "2026-04-18T00-21-52Z-f2d85402",
+  "recovered_by_session_id": "2026-04-18T00-39-10Z-1a2b3c4d",
+  "claim_path": "do-work/working/REQ-005-evidence-based-orphan-recovery.claim.json",
+  "working_request_path": "do-work/working/REQ-005-evidence-based-orphan-recovery.md",
+  "queue_request_path": "do-work/REQ-005-evidence-based-orphan-recovery.md",
+  "evidence": {
+    "verdict": "recoverable",
+    "reason": "claim heartbeat is stale, the owning session heartbeat is stale, and the owning PID is absent on this host"
+  }
+}
+```
+
+9. Only after the explicit recovery pass finishes cleanly may the operator run the normal `do work` loop again.
+
 ## Commands
 
 ### `do work`
-Process all pending requests in order. Automatically unclaims anything in `working/` that has been there longer than 1 hour before starting.
+Process all pending requests in order. Claims are atomic and session-bound. This command does **not** auto-recover anything already in `working/`; use `do work resume` when recovery evidence needs to be checked explicitly.
 
 ### `do work resume`
-Like `do work`, but unclaims everything in `do-work/working/` immediately — no age threshold. Use this when you know a previous session was interrupted and left a request stranded. The unclaimed request moves back to the front of the queue with its existing triage/plan sections preserved; the work action picks it up and continues from the implementation phase if planning is already documented.
+Inspect every claimed REQ in `do-work/working/` and recover only the unequivocal orphans: stale claim heartbeat, stale session heartbeat, same host, and absent PID. Any ambiguity halts the resume pass and surfaces the evidence instead of guessing.
 
 ### `do work REQ-005` (future enhancement)
 Process a specific request by number, regardless of status.

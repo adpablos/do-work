@@ -29,11 +29,43 @@ For simple tasks (Route A), the plan may be 1-3 lines and verification will be f
 
 ## Workflow
 
+### Step 0: Establish Session Identity
+
+Before reading or writing any file under `do-work/`, establish session identity per [actions/session-identity.md](./session-identity.md). verify-plan runs inside the work action's loop, so session identity was already established at work's Step 0 — refresh the heartbeat and proceed. If for any reason verify-plan is invoked standalone, establish a fresh session record before Step 1.
+
 ### Step 1: Read the REQ
 
 Read the request file currently being processed (in `do-work/working/`). This is the source document.
 
 Also read the UR input.md (via the REQ's `user_request` field) to catch any items from the original input that apply to this REQ but may not have made it into the REQ text. This is a second-pass safety net -- if the verify-request action missed something, this catches it.
+
+Before that read, take a per-document verify lock on the in-flight REQ and hold it until the `## Plan Verification` section has been rewritten with atomic write-then-rename. The work claim is not enough here: `verify-plan` still needs its own document lock so a concurrent manual verify cannot interleave a second read-modify-write cycle on the same REQ.
+
+```python
+from pathlib import Path
+from lib.concurrency import (
+    acquire_verification_lock,
+    release_lock,
+    rewrite_markdown_section_atomic,
+)
+
+lock = acquire_verification_lock(
+    "do-work",
+    target_path="working/REQ-007-verify-document-locks.md",
+    session_id="<current-session-id>",
+    operation="verify-plan",
+)
+try:
+    req_text = Path("do-work/working/REQ-007-verify-document-locks.md").read_text(encoding="utf-8")
+    # enumerate, map, fix, and render the new section while the lock is held
+    rewrite_markdown_section_atomic(
+        "do-work/working/REQ-007-verify-document-locks.md",
+        heading="Plan Verification",
+        new_section=rendered_plan_verification_block,
+    )
+finally:
+    release_lock(lock)
+```
 
 ### Step 2: Enumerate Source Items
 
@@ -90,7 +122,7 @@ For each missing or partial item:
 ### Step 6: Recalculate and Store
 
 1. **Recalculate coverage** after fixes (post-fix score)
-2. **Write the verification into the REQ file**, immediately after the Plan section:
+2. **Write the verification into the REQ file atomically**, immediately after the Plan section. Hold the verify lock until the rewritten section is on disk:
 
 ```markdown
 ## Plan Verification
@@ -133,3 +165,4 @@ Plan Verification: REQ-005
 - Don't replace the plan -- fix it in place, don't rewrite
 - Don't skip verification because the plan "looks complete" -- always enumerate and map
 - Don't turn a focused plan into an over-engineered one -- match the plan's level of detail
+- Don't rely on the work claim alone -- `verify-plan` still needs the per-document verify lock

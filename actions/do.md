@@ -17,6 +17,8 @@ Both are mandatory. Never create one without the other. This applies to every in
 - A UR without REQ files is pointless — nothing gets queued for the work action
 - The verify action depends on this linkage to evaluate capture quality
 
+Shared coordination helpers for lockfiles, atomic writes, atomic renames, claim-file parsing, and atomic REQ/UR ID allocation now live in [actions/concurrency-primitives.md](./concurrency-primitives.md) and `lib/concurrency.py`. The do action stays focused on capture; later REQs wire the rest of those primitives into the coordinated steps that need them.
+
 ## Philosophy
 
 - **Speed over perfection**: This is a rapid capture interface, not a design review
@@ -71,8 +73,9 @@ All request files go in the project's `do-work/` folder:
   - `assets/` — screenshots, images, and other reference materials for this request
 
 **CRITICAL: The do action writes to these locations:**
-1. `do-work/` root - ONLY for `REQ-*.md` request files (the queue)
-2. `do-work/user-requests/UR-NNN/` - For the verbatim input and assets per user request
+1. `do-work/.capture-staging/CAP-.../` - Temporary staged capture state, including staged UR/REQ files and the readable manifest used for repair
+2. `do-work/` root - ONLY for final `REQ-*.md` request files after `commit_capture_transaction(...)`
+3. `do-work/user-requests/UR-NNN/` - For the final verbatim input and assets per user request after `commit_capture_transaction(...)`
 
 **NEVER write to:**
 - `do-work/working/` - This is exclusively managed by the work action
@@ -118,7 +121,14 @@ See Step 2 for the full addendum-to-in-flight workflow.
 - Naming: `REQ-[num]-[descriptive-name].png` (or appropriate extension)
 - Examples: `do-work/user-requests/UR-003/assets/REQ-017-toc-screenshot.png`
 
-To get the next REQ number, check existing `REQ-*.md` files in `do-work/`, `do-work/working/`, and `do-work/archive/` (and inside `archive/UR-*/`), then increment from the highest. UR folders use their own numbering sequence — check `do-work/user-requests/` and `do-work/archive/UR-*/` for the highest existing UR number.
+Do **not** hand-scan for the next REQ/UR number anymore. Start a staged capture transaction in `lib.concurrency`, then reserve IDs through that transaction:
+
+- `begin_capture_transaction(...)` takes the short `capture-global` lock, fails loud if an older `CAP-*` staging folder still needs repair, and creates `do-work/.capture-staging/CAP-.../manifest.json`
+- `allocate_staged_ur_input(...)` reserves the UR ID under `id-allocation:ur`, but writes `input.md` into staging instead of `do-work/user-requests/` directly
+- `allocate_staged_req_file(...)` reserves each REQ ID under `id-allocation:req`, but writes the queue file into staging instead of `do-work/` directly
+- `commit_capture_transaction(...)` publishes the staged UR + REQs only after the staged UR `requests: [...]` array is final **and** every staged REQ already has its `## Verification` section from Step 5.5
+
+This is mandatory. Manual "scan highest ID and increment" logic is obsolete and reintroduces the race REQ-003 fixes, and direct final writes are obsolete because they reintroduce REQ-008's partial-capture orphan problem.
 
 ### Backward Compatibility
 
@@ -392,19 +402,23 @@ The work action adds additional fields (`claimed_at`, `route`, `completed_at`) a
 
 ```
 Capture order:
+[ ] Step 0.5: Establish session identity per actions/session-identity.md
 [ ] Step 1:   Parse input — single vs. multiple requests
 [ ] Step 1.5: Assess complexity — simple or complex mode
 [ ] Step 2:   Check for existing requests — duplicates, addendums
 [ ] Step 3:   Clarify only if genuinely ambiguous (skip if clear)
 [ ] Step 4:   Handle screenshots if present (skip if none)
-[ ] Step 5:   Create UR folder with input.md
-[ ] Step 5:   Create REQ file(s) with user_request: UR-NNN in frontmatter
-[ ] Step 5:   Update UR requests array with all REQ IDs
-[ ] Step 5.5: *** MANDATORY *** Verify requests — enumerate items from UR input, map to REQs, fix gaps, append ## Verification to every REQ file
+[ ] Step 5:   Begin staged capture transaction (`begin_capture_transaction`)
+[ ] Step 5:   Stage UR input.md + REQ file(s) under `.capture-staging/`
+[ ] Step 5:   Update the staged UR requests array with all REQ IDs
+[ ] Step 5.5: *** MANDATORY *** Verify staged requests — enumerate items from staged UR input, map to staged REQs, fix gaps, append ## Verification to every staged REQ file
+[ ] Step 5.6: Commit staged capture (`commit_capture_transaction`) OR preserve a failed draft via `abort_capture_transaction(...)`
 [ ] Step 6:   Report back — include verification coverage, never report without it
 ```
 
-Marking Step 5.5 as done means every REQ file you created has a `## Verification` section appended to it. If any file is missing this section, Step 5.5 is not complete — go back.
+Step 0.5 is non-negotiable: no writes to `do-work/` happen before the session record exists. If the session-identity write fails, the capture must not proceed — fail loud per the session-identity protocol.
+
+Marking Step 5.5 as done means every staged REQ file already has a `## Verification` section appended to it before publish. If any staged REQ is missing this section, Step 5.5 is not complete — go back.
 
 ### Step 1: Parse the Request
 
@@ -593,95 +607,97 @@ Screenshot of settings with a dropdown.
 
 ### Step 5: Write Request Files
 
-#### Simple Mode
+The write path is the same for simple and complex mode now: **stage everything first, verify in staging, then publish.** The final on-disk format is unchanged; only the landing protocol changed.
 
-**1. Create the User Request (UR) folder:**
-   a. Determine the next UR number (check `do-work/user-requests/` and `do-work/archive/UR-*/` for highest existing number)
-   b. Create `do-work/user-requests/UR-NNN/input.md` with the verbatim user input (minimal format — see UR input.md Format above)
-   c. Leave the `requests` array empty initially — you will fill it in step 3
+**0. Start the staged capture transaction:**
 
-**2. Create REQ files** (one per distinct request):
-   a. Determine the next REQ number (check `do-work/`, `working/`, and `archive/` for highest existing number)
-   b. Create a slug from the request (lowercase, hyphens, 3-4 words max)
-   c. Generate the current ISO 8601 timestamp for `created_at`
-   d. Write the file using the **simple request format**
-   e. **Set `user_request: UR-NNN`** in frontmatter — this links the REQ back to its UR
-   f. Keep the original verbatim request in the Source field
+```python
+from lib.concurrency import begin_capture_transaction
 
-**3. Link them together:**
-   a. Update the UR's `requests` array with all created REQ IDs
-   b. Verify every REQ file has `user_request: UR-NNN` in its frontmatter
-
-#### Complex Mode
-
-For complex, multi-feature requests:
-
-**1. Create the User Request (UR) folder first:**
-
-1. Determine the next UR number (check `do-work/user-requests/` and `do-work/archive/UR-*/`)
-2. Create `do-work/user-requests/UR-NNN/`
-3. Create `do-work/user-requests/UR-NNN/assets/` (for screenshots/attachments)
-4. Write `do-work/user-requests/UR-NNN/input.md`:
-
-```yaml
----
-id: UR-001
-title: [Descriptive name for this batch]
-created_at: 2025-01-26T10:00:00Z
-requests: []  # Will fill in after creating requests
-word_count: [count words in original input]
----
+capture = begin_capture_transaction(
+    "do-work",
+    session_id="<current-session-id>",
+    operation="do",
+)
 ```
 
-- Include a brief summary (2-3 sentences)
-- Leave the `requests` array empty initially
-- **Paste the FULL verbatim input** in the "Full Verbatim Input" section
-- Do NOT edit, clean up, or summarize the verbatim input
+- This takes `do-work/.locks/capture-global.lock` for the duration of capture.
+- If `begin_capture_transaction(...)` sees an older `CAP-*` staging folder that is not fully committed, **stop immediately** and surface the `capture_id`. Do not silently clean it up.
+- If the user request includes valuable verbatim input and the capture later fails, prefer preserving the staged draft (`abort_capture_transaction(..., preserve_draft=True)`) so the input remains recoverable.
 
-**2. Identify all distinct features/requests:**
-- Read through the input carefully
-- List each distinct feature, component, or deliverable
-- Note dependencies between them
-- Note shared constraints or requirements
+**1. Stage the UR input first:**
 
-**3. Create individual request files:**
+1. Build the initial `input.md` content exactly as before, but leave `requests: []` empty on the first pass.
+2. Call `allocate_staged_ur_input(...)` to reserve the UR ID and write that initial file into staging.
+3. If screenshots/assets exist, copy them into the staged UR folder (`Path(ur.path).parent / "assets"`), not into `do-work/user-requests/` directly.
 
-For EACH identified feature:
-1. Determine the next REQ number
-2. Create using the **complex request format**
-3. Set `user_request` to the UR identifier (e.g., `UR-001`)
-4. Set `related` to other REQ IDs in this batch
-5. Set `batch` to a short name for this group
+```python
+from lib.concurrency import allocate_staged_ur_input
 
-**Critical: Detailed Requirements section**
+ur = allocate_staged_ur_input(
+    capture,
+    do_work_root="do-work",
+    content=initial_ur_input_md,
+)
+```
 
-This is where lossiness happens. For each request:
-- Extract EVERY requirement from the original input that applies to THIS feature
-- **DO NOT SUMMARIZE** - use the user's words or close paraphrases
-- Include specific values, constraints, conditions
-- Include edge cases and error handling requirements
-- Include "must", "should", "never" statements
-- If something might apply, include it (let builder filter)
+**2. Stage each REQ file:**
 
-**4. Update the UR input.md:**
-- Go back and fill in the `requests` array with all created REQ IDs
-- Update the "Extracted Requests" table
+For every parsed request:
+1. Create the same REQ content you would normally create (simple or complex format).
+2. Set `user_request: UR-NNN` in frontmatter, using the staged UR ID you just reserved.
+3. Call `allocate_staged_req_file(...)` so the REQ ID is reserved under the namespace lock, but the file lands in `do-work/.capture-staging/CAP-.../reqs/`.
 
-**4.5. Identify Batch-Level Concerns:**
-- After creating all REQs, identify any requirements that apply to the BATCH as a whole, not individual REQs
-- Add these to the UR's input.md as a "Batch Constraints" section
-- Examples: sequencing ("make sure everything's stable first"), shared design principles, performance budgets, user tone signals ("keep it simple," "don't over-engineer")
-- These should also appear in each relevant REQ's Constraints section so builders see them without needing to read the context doc
+```python
+from lib.concurrency import allocate_staged_req_file
 
-**5. Verify completeness:**
-- Re-read the original input
-- Check that every requirement appears in at least one request file
-- Check that every REQ captures relevant UX/interaction details (e.g., "auto-scroll to current file," "collapse on click," "highlight active item" type behaviors) — these are easy to drop
-- Check that cross-cutting/batch concerns from step 4.5 appear in every relevant REQ's Constraints section
-- Check that the user's intent signals are preserved — not just the WHAT, but the HOW-FIRMLY (exploratory vs firm, latitude given, scope cues)
-- If something doesn't fit any request, either:
-  - Create another request for it, OR
-  - Add it to the most relevant request's "Context" section
+req = allocate_staged_req_file(
+    capture,
+    do_work_root="do-work",
+    slug="lowercase-hyphenated-slug",
+    content=rendered_req_md,
+)
+```
+
+**3. Update the staged UR once all REQs exist:**
+
+- Rewrite the staged `input.md` so its `requests: [...]` array contains the final REQ IDs.
+- For complex captures, also fill the "Extracted Requests" table and any batch-level constraints after all REQ IDs are known.
+- Re-read the original input and make sure every requirement appears in at least one staged REQ before moving on.
+
+**4. If anything fails before publish:**
+
+```python
+from lib.concurrency import abort_capture_transaction, release_capture_transaction
+
+try:
+    ...
+except Exception as exc:
+    abort_capture_transaction(
+        capture,
+        reason=str(exc),
+        preserve_draft=True,
+    )
+    raise
+finally:
+    release_capture_transaction(capture)
+```
+
+- A preserved failed draft keeps the verbatim input and reserved IDs inside `do-work/.capture-staging/CAP-.../`.
+- Those IDs remain out of the pool until an explicit `repair_capture_state(...)` discards or finishes that capture.
+- If you intentionally discard the draft during repair before any publish happened, the IDs return to the pool.
+
+**5. Publish only after Step 5.5 succeeds:**
+
+```python
+from lib.concurrency import commit_capture_transaction
+
+commit_capture_transaction(capture)
+```
+
+- This is the only moment the UR folder and REQ queue files move into their final visible locations.
+- The commit helper validates the atomic unit first: one staged UR, at least one staged REQ, matching `requests: [...]`, matching `user_request` links, and a `## Verification` section in every staged REQ.
+- If commit crashes after one or more `atomic_rename(...)` operations, the staging manifest is left in `committing` state and `repair_capture_state(...)` must resume the publish. Do not hand-fix partial state in the queue.
 
 **Frontmatter examples:**
 
@@ -713,17 +729,17 @@ batch: auth-system
 
 **[Mandatory step -- runs automatically after file creation]**
 
-Verify the REQ files you just created against the UR's verbatim input. Fix any gaps. Store the results. Do not ask the user for permission — just fix and report.
+Verify the **staged** REQ files you just created against the **staged** UR verbatim input. Fix any gaps. Store the results. Do not ask the user for permission — just fix and report.
 
 **Skip condition:** If the user's input included "skip verification" or similar language, skip this step entirely.
 
 **1. Enumerate source items:**
 
-Re-read the UR's verbatim input. Extract a numbered list of every discrete requirement, constraint, behavior, UX detail, intent signal, and edge case the user mentioned. One item per line. If they said it, it counts — even passing mentions.
+Re-read the staged UR's verbatim input. Extract a numbered list of every discrete requirement, constraint, behavior, UX detail, intent signal, and edge case the user mentioned. One item per line. If they said it, it counts — even passing mentions.
 
 **2. Map each item to the REQs:**
 
-For each enumerated item, find where it appears in the REQ files you just created. Classify each:
+For each enumerated item, find where it appears in the staged REQ files you just created. Classify each:
 - **Full** -- present with appropriate detail
 - **Partial** -- mentioned but missing specifics
 - **Missing** -- not in any REQ
@@ -734,12 +750,44 @@ Coverage % = (full + 0.5 x partial) / total x 100
 
 **4. Auto-fix gaps (do not ask -- just fix):**
 
-For each missing or partial item, edit the appropriate REQ file directly:
+For each missing or partial item, edit the appropriate staged REQ file directly:
 - Add missing items as bullet points in the most relevant section
 - Expand partial items with the missing detail
 - Don't invent requirements — only add what the user actually said
 
-**5. Store results — append to each REQ file:**
+Before touching any staged REQ file in this step, take the same per-document verify lock used by the manual verify actions and hold it for the entire read-compute-write cycle. Step 5.5 is not exempt just because it runs inside capture, even though the files are still under `.capture-staging/`.
+
+```python
+from pathlib import Path
+from lib.concurrency import (
+    acquire_verification_lock,
+    release_lock,
+    rewrite_markdown_section_atomic,
+)
+
+lock = acquire_verification_lock(
+    "do-work",
+    target_path=".capture-staging/CAP-.../reqs/REQ-007-verify-document-locks.md",
+    session_id="<current-session-id>",
+    operation="verify-request",
+)
+try:
+    req_text = Path("do-work/.capture-staging/CAP-.../reqs/REQ-007-verify-document-locks.md").read_text(encoding="utf-8")
+    # compute coverage + fixes while the lock is still held
+    rewrite_markdown_section_atomic(
+        "do-work/.capture-staging/CAP-.../reqs/REQ-007-verify-document-locks.md",
+        heading="Verification",
+        new_section=rendered_verification_block,
+    )
+finally:
+    release_lock(lock)
+```
+
+- No retry loops here. If another verification already holds `do-work/.locks/verify-REQ-NNN.lock`, fail loud and report the holder session.
+- The lock name must stay predictable for `ls` debugging, e.g. `do-work/.locks/verify-REQ-007.lock`.
+- Lock the staged REQ being rewritten, not the UR `input.md`.
+
+**5. Store results — rewrite the `## Verification` section atomically in each REQ file:**
 
 ```markdown
 ## Verification
@@ -765,6 +813,8 @@ For each missing or partial item, edit the appropriate REQ file directly:
 ```
 
 See [verify-request action](./verify-request.md) for the full protocol (used when running verification manually via `do work verify`).
+
+**Only after every staged REQ has its stored `## Verification` block should you call `commit_capture_transaction(...)`.** Step 5.5 is part of the atomic unit; a capture that crashes before storing verification is still partial and must stay in staging.
 
 ### Step 6: Report Back
 
@@ -822,19 +872,22 @@ Use this to verify you haven't skipped a step:
 □ Check for existing requests — duplicates, addendums (Step 2)
 □ Clarify only if genuinely ambiguous (Step 3)
 □ Handle screenshots if present (Step 4)
-□ Create UR folder with input.md (Step 5)
-□ Create REQ file(s) with user_request: UR-NNN in frontmatter (Step 5)
-□ Update UR requests array with all REQ IDs (Step 5)
-□ Run verify-request on created REQs — enumerate, map, fix, store (Step 5.5)
+□ Begin staged capture transaction (Step 5)
+□ Stage UR input.md + REQ file(s) with user_request: UR-NNN in frontmatter (Step 5)
+□ Update the staged UR requests array with all REQ IDs (Step 5)
+□ Run verify-request on staged REQs — enumerate, map, fix, store (Step 5.5)
+□ Commit staged capture only after verification is present everywhere (Step 5.6)
 □ Report created files to user, include verification coverage (Step 6)
 ```
 
 **Common mistakes:**
-- Creating REQ files but forgetting the UR folder
-- Creating the UR folder but not setting `user_request` in REQ frontmatter
+- Publishing REQ files directly instead of staging them first
+- Creating staged REQ files but forgetting the staged UR folder
+- Creating the staged UR folder but not setting `user_request` in staged REQ frontmatter
 - Skipping the UR for simple requests (it's required for ALL requests)
-- Not updating the UR's `requests` array after creating REQs
+- Not updating the staged UR's `requests` array after creating REQs
 - Skipping verify-request (it's mandatory unless the user said "skip verification")
+- Calling `commit_capture_transaction(...)` before every staged REQ has a `## Verification` section
 
 ## Examples
 
