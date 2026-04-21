@@ -785,6 +785,46 @@ class ConcurrencyPrimitivesTest(unittest.TestCase):
         self.assertTrue((do_work_root / ".capture-staging").exists())
         self.assertTrue(Path(ur.path).exists())
 
+    def test_abort_refuses_when_status_is_committing_regardless_of_preserve_draft(self) -> None:
+        """Regression: abort_capture_transaction must not mark a committing
+        transaction as failed, because commit may have already published
+        some items — marking failed would split-brain published files
+        against a failed manifest. Raise regardless of preserve_draft."""
+        do_work_root = self.root / "do-work"
+        transaction = begin_capture_transaction(
+            do_work_root,
+            session_id="session-1",
+            operation="do",
+            now=datetime(2026, 4, 20, 23, 20, tzinfo=timezone.utc),
+        )
+        allocate_staged_ur_input(
+            transaction,
+            do_work_root=do_work_root,
+            content="---\nid: UR-001\ntitle: Draft\ncreated_at: 2026-04-20T23:20:00Z\nrequests: []\nword_count: 1\n---\n",
+            now=datetime(2026, 4, 20, 23, 20, tzinfo=timezone.utc),
+        )
+
+        # Simulate a commit in flight by flipping the on-disk manifest to
+        # status="committing". This is the exact state that would exist if
+        # commit_capture_transaction had started publishing items and was
+        # interrupted mid-way.
+        with open(transaction.manifest_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data["status"] = "committing"
+        with open(transaction.manifest_path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+        for preserve in (True, False):
+            with self.assertRaises(ConcurrencyError) as ctx:
+                abort_capture_transaction(
+                    transaction,
+                    reason=f"racing abort with preserve_draft={preserve}",
+                    now=datetime(2026, 4, 20, 23, 20, 1, tzinfo=timezone.utc),
+                    preserve_draft=preserve,
+                )
+            self.assertIn("already committing", str(ctx.exception))
+            self.assertIn("repair_capture_state", str(ctx.exception))
+
     def test_repair_capture_state_discards_failed_stage_and_releases_reserved_ids(self) -> None:
         do_work_root = self.root / "do-work"
         transaction = begin_capture_transaction(

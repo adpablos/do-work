@@ -8,6 +8,12 @@ do-work/.sessions/
 # Lockfiles — ephemeral runtime state per actions/concurrency-primitives.md
 do-work/.locks/
 
+# Capture staging — in-flight UR+REQ drafts; survive crashes, removed on commit/abort
+do-work/.capture-staging/
+
+# Cleanup claim sidecars — ephemeral, written by claim_cleanup
+do-work/.claims/
+
 # Python bytecode
 __pycache__/
 

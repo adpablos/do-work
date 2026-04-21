@@ -26,6 +26,12 @@ from typing import Any, Iterable, Literal, Optional, Union
 
 PathLike = Union[str, os.PathLike]
 
+# Default threshold for treating a heartbeat as stale. Must stay in sync
+# with actions/session-identity.md. Claim and lock staleness checks use
+# this unless a caller overrides it explicitly. The stale threshold is
+# always at least 2× the documented heartbeat cadence to absorb jitter.
+DEFAULT_STALE_THRESHOLD: timedelta = timedelta(minutes=2)
+
 CANONICAL_SCOPES: frozenset[str] = frozenset({
     "capture-global",
     "id-allocation:req",
@@ -968,8 +974,20 @@ def atomic_write(path: PathLike, content: str, *, mode: str = "w") -> None:
 
 
 def atomic_rename(src: PathLike, dst: PathLike, *, transition: str) -> None:
-    """Atomic state transition. Raises rich errors instead of POSIX rename's
-    silent overwrite / cryptic errnos.
+    """State transition helper around os.rename with rich errors.
+
+    Pre-checks for src existence and dst collision, then renames atomically.
+    The rename itself is atomic on POSIX, but the dst-collision check is a
+    separate stat — a TOCTOU gap exists between the check and the rename.
+    POSIX os.rename will silently overwrite dst if it appears in that
+    window (for same-type paths). Callers must serialize competing
+    transitions to the same dst with an appropriate lock; existing callers
+    do this via per-scope O_EXCL lockfiles (per-UR archival, cleanup,
+    capture-global, etc.).
+
+    Raises CollisionError if dst exists at check time, StaleRenameError if
+    src is missing, CrossDeviceError if src and dst are on different
+    filesystems.
     """
     src_s = os.fspath(src)
     dst_s = os.fspath(dst)
@@ -979,8 +997,9 @@ def atomic_rename(src: PathLike, dst: PathLike, *, transition: str) -> None:
         )
     if os.path.exists(dst_s):
         raise CollisionError(
-            f"atomic_rename[{transition}]: destination {dst_s!r} already exists. "
-            "Atomic rename refuses silent overwrite."
+            f"atomic_rename[{transition}]: destination {dst_s!r} already "
+            "exists at check time. Callers must serialize competing "
+            "transitions via locks; this guard is TOCTOU, not atomic."
         )
     try:
         os.rename(src_s, dst_s)
@@ -1695,7 +1714,7 @@ def classify_lock(
     info: LockInfo,
     *,
     now: datetime,
-    stale_threshold: timedelta = timedelta(minutes=2),
+    stale_threshold: timedelta = DEFAULT_STALE_THRESHOLD,
 ) -> Literal["live", "stale", "orphaned"]:
     """Classify an existing lock. Pure — no filesystem mutation, no I/O beyond
     a liveness probe of the holder's PID.
@@ -2182,7 +2201,7 @@ def verify_and_stage_claim_scope(
     current_request_path: PathLike,
     expected_session_id: Optional[str] = None,
     now: Optional[datetime] = None,
-    stale_threshold: timedelta = timedelta(minutes=2),
+    stale_threshold: timedelta = DEFAULT_STALE_THRESHOLD,
 ) -> ScopedStageResult:
     if isinstance(claim_handle_or_path, WorkClaimHandle):
         claim_path = claim_handle_or_path.claim_path
@@ -2294,7 +2313,7 @@ def inspect_work_claim_recovery(
     *,
     claim_path: PathLike,
     now: Optional[datetime] = None,
-    stale_threshold: timedelta = timedelta(minutes=2),
+    stale_threshold: timedelta = DEFAULT_STALE_THRESHOLD,
 ) -> WorkClaimRecoveryInspection:
     root = _coerce_do_work_root(do_work_root)
     claim = read_claim(claim_path)
@@ -2430,7 +2449,7 @@ def recover_orphaned_work_claim(
     claim_path: PathLike,
     recovering_session_id: str,
     now: Optional[datetime] = None,
-    stale_threshold: timedelta = timedelta(minutes=2),
+    stale_threshold: timedelta = DEFAULT_STALE_THRESHOLD,
 ) -> RecoveredWorkClaim:
     inspection = inspect_work_claim_recovery(
         do_work_root,
@@ -2488,10 +2507,24 @@ def recover_orphaned_work_claim(
             ) from rollback_exc
         raise
 
-    release_claim(
-        inspection.claim_path,
-        expected_session_id=inspection.claim.session_id,
-    )
+    try:
+        release_claim(
+            inspection.claim_path,
+            expected_session_id=inspection.claim.session_id,
+        )
+    except Exception as exc:
+        # The REQ is already back in the queue and the recovery log is
+        # written, so the state is partially recovered — but the claim
+        # sidecar lingers in working/. Surface it so the operator can
+        # finish the cleanup manually rather than leaving the skill in
+        # an inconsistent state silently.
+        raise ConcurrencyError(
+            f"orphan recovery moved {inspection.claim.claim_id} back to the "
+            f"queue and wrote the recovery log, but failed to release the "
+            f"stale claim sidecar at {inspection.claim_path!r}: {exc}\n"
+            "  Manually remove the stale .claim.json to complete recovery. "
+            "The REQ itself is safe and available in the queue."
+        ) from exc
 
     session_path = inspection.session_record_path
     try:
@@ -3054,6 +3087,17 @@ def abort_capture_transaction(
     if preserve_draft is None:
         preserve_draft = manifest.preserve_verbatim_input_on_failure
 
+    # Guard applies regardless of preserve_draft: once a commit is in flight,
+    # some staged items may already be published to final paths. Marking the
+    # manifest "failed" here (in either branch) would create a split-brain
+    # where published files exist but the manifest denies them. Surface the
+    # in-flight commit so the operator calls repair_capture_state() instead.
+    if manifest.status == "committing":
+        raise ConcurrencyError(
+            f"capture {manifest.capture_id} is already committing; use "
+            "repair_capture_state(...) to finish or inspect it"
+        )
+
     updated_at = _iso(now or _utcnow())
     if preserve_draft:
         updated = CaptureManifest(
@@ -3068,12 +3112,6 @@ def abort_capture_transaction(
             items=manifest.items,
         )
         return _update_capture_manifest(transaction, updated)
-
-    if manifest.status == "committing":
-        raise ConcurrencyError(
-            f"capture {manifest.capture_id} is already committing; use "
-            "repair_capture_state(...) to finish or inspect it"
-        )
 
     _cleanup_capture_stage_dir(Path(transaction.manifest_path).parent)
     updated = CaptureManifest(
