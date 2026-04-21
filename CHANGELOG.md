@@ -4,130 +4,22 @@ What's new, what's better, what's different. Most recent stuff on top.
 
 ---
 
-## 0.22.0 — The Safety Net (2026-04-20)
+## 0.14.0 — The Parallel Pact (2026-04-21)
 
-Capture stopped leaking half-finished state into the queue. New requests now stage privately, get verified before publish, and leave a readable draft or resumable manifest behind if the session dies at the wrong moment.
+`do-work` now runs safely under concurrent sessions. The whole of UR-001 lands as one release: session identity + heartbeat, shared coordination primitives, atomic IDs and claims, evidence-based orphan recovery, atomic archival and cleanup, per-document verify locks, capture atomicity with rollback, and scoped commits that refuse to absorb foreign edits. The filesystem is still the source of truth — no new runtime dependencies, stdlib-only.
 
-- Added staged capture transaction + repair helpers in `lib/concurrency.py`, including draft-preserving aborts and resumable publish after a mid-commit crash
-- Reserved UR/REQ IDs while a staged draft exists, and documented the release policy: discard frees them, interrupted publish resumes forward
-- Added regression coverage for staged commit, fail-loud partial-state detection, ID reuse after explicit discard, and crash recovery during publish
-- Rewrote the do-action and concurrency-primitives docs around the staged Step 5 / Step 5.5 / Step 5.6 flow
-- Archived `REQ-008` as completed
-
-## 0.21.0 — The Door Latch (2026-04-20)
-
-Verify runs stop stepping on each other now. A REQ under verification gets its own named document lock, the verification block rewrites atomically, and the loser in a race gets told exactly who is holding the file instead of quietly clobbering output.
-
-- Added verify-document helpers in `lib/concurrency.py` for predictable `verify-REQ-NNN.lock` naming, fail-fast verify locking, and atomic section replacement
-- Added regression coverage for the verify-request race plus helper-level checks around lock naming and markdown section replacement
-- Updated the verify-request, verify-plan, do-action Step 5.5, and concurrency-primitives docs so all verify flows follow the same lock protocol
-- Archived `REQ-007` as completed
-- Bumped the public skill version to `0.21.0`
-
-## 0.20.0 — The Mop Guard (2026-04-20)
-
-Cleanup stopped freelancing. Only one cleanup run can hold the room at a time now, and if another session is already sweeping, you get told exactly who is holding the lock instead of wandering into a second pass.
-
-- Added a cleanup-specific global claim/lock flow in `lib/concurrency.py`, including heartbeat refresh and explicit fail-loud behavior for ambiguous stale state
-- Added regression coverage for cleanup claim lifecycle plus the required two-cleanup race with one winner and one named holder
-- Updated the cleanup/concurrency docs to lock in the short-lock + re-scan model and explicitly reject a `force` bypass
-- Archived `REQ-009` as completed
-- Bumped the public skill version to `0.20.0`
-
-## 0.19.0 — The Scope Fence (2026-04-20)
-
-Work commits keep to their lane now. A claimed REQ snapshots Git tree state up front, freezes its commit scope before implementation, and refuses to commit if anything foreign shows up outside that fence.
-
-- Added claim-sidecar tree snapshots plus scoped commit verification/staging helpers in `lib/concurrency.py`
-- Added Git-backed regression tests for dirty-tree refusal, foreign edits between claim and commit, and scoped staging
-- Rewrote `actions/work.md` to document the tree-state contract and replace `git add -A` with scoped re-verification
-- Archived `REQ-010` as completed
-- Bumped the public skill version to `0.19.0`
-
-## 0.18.0 — The Archive Handshake (2026-04-20)
-
-The last-REQ archive move stops freelancing now. Work archives the finished REQ first, then takes a short per-UR lock to decide whether the parent UR or shared legacy CONTEXT can move, so concurrent finishers stop tripping over the same folder.
-
-- Added archival helpers to `lib/concurrency.py` for completed REQs, final UR moves, and shared legacy CONTEXT moves
-- Added archival regression tests, including a parallel UR race that proves one winner and clean `already-archived` losers
-- Rewrote the work/cleanup docs to use the helper flow and locked in the REQ-006 vs REQ-009 coordination choice: per-UR lock for work, re-scan under cleanup's global lock later
-- Archived `REQ-006` as completed
-- Bumped the public skill version to `0.18.0`
-
-## 0.17.0 — The Rescue Rope (2026-04-20)
-
-Stranded work no longer gets guessed back into the queue. `do work resume` now has a real recovery path: it only frees a REQ when the claim heartbeat is stale, the owning session is stale too, and the original PID is gone on this host. Everything else stays loud and visible instead of being "helpfully" stolen.
-
-- Added explicit orphan-recovery helpers to `lib/concurrency.py`, including recovery inspection, session-record parsing, on-disk recovery logs, and claim/session cleanup
-- Added recovery-focused concurrency tests for missing session records, foreign-host claims, ambiguous live-PID cases, and successful orphan recovery
-- Rewrote `actions/work.md` so normal `do work` never auto-recovers and `do work resume` is now the single explicit recovery workflow with breadcrumb requirements
-- Updated the concurrency-primitives contract to document the new recovery API surface and fail-loud behavior
-
-## 0.16.0 — The Bouncer (2026-04-20)
-
-Work claims are now atomic and single-winner. Two sessions racing for the same REQ can no longer both move it into `working/` — one wins, the other gets a clear error naming the holder. Under the hood, claiming writes an `O_EXCL` sidecar `.claim.json` next to the REQ and only then renames the REQ into place; a failed rename rolls the sidecar back cleanly.
-
-- Added `claim_work_request`, `release_claim`, `refresh_claim_heartbeat` + `ClaimHeldError` / `SessionClaimConflictError` in `lib/concurrency.py`
-- 7 new concurrency tests including a 20-process race that proves exactly one winner (30 total, all green)
-- `actions/work.md` Step 2 rewritten to use the atomic helper; one-claim-per-session enforced
-- **Removed** the 1-hour TTL auto-unclaim — pure-timestamp guessing was incompatible with REQ-001's heartbeat model and UR-001's binding recovery decision. Recovery belongs to REQ-005, landing next
-- Archived `REQ-004` as completed
-
----
-
-## 0.15.2 — The Turnstile (2026-04-18)
-
-Parallel capture stops guessing IDs now. REQ and UR allocation both go through short namespace locks, so concurrent sessions mint unique placeholders on disk before they let go.
-
-- Added atomic REQ/UR allocators to `lib/concurrency.py` with separate `id-allocation:req` and `id-allocation:ur` scopes
-- Added allocator coverage in `lib/concurrency_test.py` for scan sources, cleanup on failed writes, lock independence, and concurrent unique-ID allocation
-- Updated `actions/do.md` and `actions/concurrency-primitives.md` so capture uses the shared allocator instead of hand-scanning for the next number
-- Archived `REQ-003` as completed
-
----
-
-## 0.15.1 — The Sweep Up (2026-04-17)
-
-Small cleanup pass after the concurrency library landed. Python bytecode artifacts are ignored now, so running the isolated test suite no longer dirties the repo or sneaks cache files into future commits.
-
-- Added `__pycache__/` to `.gitignore`
-- Removed generated `.pyc` files created by the new unittest run
-
----
-
-## 0.15.0 — The Lockbox (2026-04-17)
-
-Parallel-safe coordination now has a real runtime behind it. The skill ships a shared concurrency library with lockfiles, atomic writes, atomic renames, and claim-file helpers, plus isolated tests so later REQs can wire it in without inventing their own filesystem tricks.
-
-- Added `lib/concurrency.py` with stdlib-only primitives for exclusive locks, heartbeats, atomic file writes, atomic state transitions, and shared claim-file parsing
-- Added `lib/concurrency_test.py` with isolated unit coverage plus a 20-process race test to prove only one lock holder wins
-- Added `actions/concurrency-primitives.md` as the canonical contract for scope names, lockfile schema, failure modes, and non-goals
-- Updated session/work/do/cleanup docs and `SKILL.md` to point at the shared primitives without prematurely rewiring later REQs
-- Added `do-work/.locks/` to `.gitignore` because lockfiles are runtime state, not history
-
----
-
-## 0.14.0 — The Name Tag (2026-04-17)
-
-First foundational REQ of the parallel-safety work lands: every coordinated action now declares a session identity and writes a heartbeat to disk before touching `do-work/`. Nothing else about the skill changes yet — claims, locks, and orphan recovery come next, and they all consume this. Session records live in `do-work/.sessions/` and are gitignored because they are ephemeral runtime state.
-
-- New `actions/session-identity.md` — the source-of-truth protocol: session ID format, record schema, heartbeat cadence, lifecycle, debuggability guarantees
-- SKILL.md points at the new action and introduces "session protocol" as a cross-cutting concept
-- Step 0 of `do.md`, `work.md`, `verify-request.md`, `verify-plan.md`, and `cleanup.md` now requires establishing session identity before any coordinated write
-- `.gitignore` excludes `do-work/.sessions/`
-- `version` action remains exempt — read-only, no coordinated writes
-- Stale-claim TTL logic in `work.md` flagged but left alone; its replacement is REQ-005
-
----
-
-## 0.13.3 — The First Dogfood (2026-04-17)
-
-First real meta-capture: the parallel-safety PRD became UR-001 with ten linked REQs, each mapping the PRD's failure modes and binding architectural decisions to a discrete piece of work. The draft is gone — the UR is now the source of truth — and the queue is sequenced so session identity and shared primitives land before any of the race fixes that depend on them.
-
-- Captured `docs/prd/do-work-parallel-safety.md` into `do-work/user-requests/UR-001/` + REQ-001 through REQ-010
-- Every REQ carries the five batch constraints (filesystem-only, session ID + heartbeat, fail-loud, claim + commit snapshot, shared primitives) as binding context
-- Draft PRD removed from `docs/prd/` per the "UR is canonical" convention
-- Work happening on branch `prd/parallel-safety` — trunk is not yet affected
+- **Foundation**: new `actions/session-identity.md` (session ID + heartbeat on disk), plus `lib/concurrency.py` + `actions/concurrency-primitives.md` for O_EXCL lockfiles, atomic rename, atomic writes, and a shared claim schema.
+- **Atomic allocation**: REQ and UR IDs mint under short namespace locks; parallel captures can no longer collide.
+- **Atomic claims**: work action writes an `O_EXCL` `.claim.json` sidecar before moving a REQ into `working/`. One claim per REQ, one claim per session. The loser in a race sees a clear error naming the holder.
+- **Evidence-based recovery**: `do work resume` is now the only explicit recovery path. A claim is freed only when the heartbeat is stale AND the owning session is stale AND the PID is gone on the current host. Pure TTL recovery is gone; ambiguous cases surface and halt.
+- **Atomic archival + cleanup**: per-UR locks for the final-REQ archive; global short lock for `do work cleanup`. No folder-move races, no silent duplicates.
+- **Verify document locks**: verify-request, verify-plan, and Step 5.5 all take predictable per-document locks (`verify-REQ-NNN.lock`) and rewrite the `## Verification` section atomically. Fail-fast, no retry loops.
+- **Capture atomicity**: staged UR + REQ writes under a manifest; publish is resumable after a mid-commit crash; abort preserves the verbatim draft by default; IDs stay reserved while a partial draft exists.
+- **Foreign-edit detection**: claim-time snapshot of the tree and HEAD; commit-time scoped staging replaces `git add -A`; any foreign edit outside the frozen scope halts the commit with an actionable error.
+- **59 tests** including a 20-process race proving exactly one winner per scope. Run with `python3 -m unittest lib.concurrency_test`.
+- **Removed**: the 1-hour TTL auto-unclaim in `actions/work.md`. Pure-timestamp recovery is incompatible with the new claim model and is replaced by the evidence-based path above.
+- **First dogfood**: the PRD lived briefly as a draft in `docs/prd/`, was captured into UR-001 by `do work` itself (the draft is gone — the UR is now canonical), split into REQ-001..REQ-010, and each REQ was executed through `do work run` to produce the commits in this release. See `do-work/archive/UR-001/` for per-REQ implementation notes preserved as living logs.
+- **Post-review polish**: `abort_capture_transaction` can no longer split-brain a committing transaction regardless of `preserve_draft`; `atomic_rename` docstring reflects its TOCTOU contract honestly (callers serialize via locks); `DEFAULT_STALE_THRESHOLD` consolidated as a module constant so `actions/session-identity.md` stays the single source of truth; `.capture-staging/` and `.claims/` added to `.gitignore`; `recover_orphaned_work_claim` surfaces an actionable message if it can't release the claim sidecar after the REQ is already back in the queue.
 
 ---
 
