@@ -3115,6 +3115,13 @@ def abort_capture_transaction(
 
     updated_at = _iso(now or _utcnow())
     if preserve_draft:
+        # preserve_draft=True only delays deletion of the staging dir until
+        # the next repair_capture_state() call — it is NOT durable
+        # preservation. begin_capture_transaction() refuses to run while a
+        # non-committed manifest exists, which forces the operator to call
+        # repair, which then discards the draft. If you need the verbatim
+        # input for later inspection, copy it out of the staging dir
+        # between this abort and the next repair.
         updated = CaptureManifest(
             capture_id=manifest.capture_id,
             session_id=manifest.session_id,
@@ -3128,6 +3135,9 @@ def abort_capture_transaction(
         )
         return _update_capture_manifest(transaction, updated)
 
+    # Staging dir and manifest are deleted here; transaction.manifest_path
+    # will dangle after this call. Only transaction.lock remains valid
+    # (for release_capture_transaction). Do not re-read the manifest.
     _cleanup_capture_stage_dir(Path(transaction.manifest_path).parent)
     updated = CaptureManifest(
         capture_id=manifest.capture_id,
@@ -3308,11 +3318,27 @@ def repair_capture_state(
             )
 
         if manifest.status in {"staging", "failed"}:
+            # Distinguish "preserved" drafts from plain staged/failed ones
+            # in the result detail. preserve_verbatim_input_on_failure was
+            # set to signal "hold onto this for inspection", but repair is
+            # the contract boundary where the staging dir has to go — so
+            # the operator sees that a preservation flag was honored-then-
+            # discarded rather than silently ignored.
+            preserved = (
+                manifest.status == "failed"
+                and manifest.preserve_verbatim_input_on_failure
+            )
+            detail = (
+                "discarded preserved draft (preserve_verbatim_input_on_failure=True) "
+                "and released reserved IDs"
+                if preserved
+                else "discarded staged draft and released reserved IDs"
+            )
             _cleanup_capture_stage_dir(stage_dir)
             return CaptureRepairResult(
                 capture_id=manifest.capture_id,
                 outcome="discarded-draft",
-                detail="discarded staged draft and released reserved IDs",
+                detail=detail,
             )
 
         transaction = CaptureTransaction(
