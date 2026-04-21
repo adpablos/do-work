@@ -14,6 +14,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -26,6 +27,7 @@ from typing import Any, Iterable, Literal, Optional, Union
 PathLike = Union[str, os.PathLike]
 
 CANONICAL_SCOPES: frozenset[str] = frozenset({
+    "capture-global",
     "id-allocation:req",
     "id-allocation:ur",
     "cleanup-global",
@@ -82,6 +84,10 @@ class LockHeldError(ConcurrencyError):
 
 class ClaimFormatError(ConcurrencyError):
     """Raised when a claim file fails to parse or is missing required fields."""
+
+
+class CaptureFormatError(ConcurrencyError):
+    """Raised when a capture manifest fails to parse or is missing fields."""
 
 
 class ClaimHeldError(ConcurrencyError):
@@ -218,6 +224,7 @@ def _iter_authoritative_req_paths(do_work_root: PathLike) -> Iterable[Path]:
         "working/REQ-*.md",
         "archive/REQ-*.md",
         "archive/UR-*/REQ-*.md",
+        ".capture-staging/*/reqs/REQ-*.md",
     )
     for pattern in patterns:
         yield from root.glob(pattern)
@@ -228,6 +235,7 @@ def _iter_authoritative_ur_paths(do_work_root: PathLike) -> Iterable[Path]:
     patterns = (
         "user-requests/UR-*",
         "archive/UR-*",
+        ".capture-staging/*/user-requests/UR-*",
     )
     for pattern in patterns:
         yield from root.glob(pattern)
@@ -645,6 +653,291 @@ class RequestArchivalResult:
             data["parent_result"] = self.parent_result.to_dict()
         return data
 
+
+@dataclass(frozen=True)
+class CaptureItem:
+    kind: Literal["ur-dir", "req"]
+    identifier: str
+    staged_path: str
+    final_path: str
+    state: Literal["staged", "published"] = "staged"
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "CaptureItem":
+        required = {"kind", "identifier", "staged_path", "final_path", "state"}
+        missing = required - set(d)
+        if missing:
+            raise CaptureFormatError(
+                f"capture item missing fields: {sorted(missing)}"
+            )
+        kind = d["kind"]
+        state = d["state"]
+        if kind not in {"ur-dir", "req"}:
+            raise CaptureFormatError(
+                f"capture item kind must be 'ur-dir' or 'req', got {kind!r}"
+            )
+        if state not in {"staged", "published"}:
+            raise CaptureFormatError(
+                f"capture item state must be 'staged' or 'published', got {state!r}"
+            )
+        return cls(
+            kind=kind,
+            identifier=d["identifier"],
+            staged_path=d["staged_path"],
+            final_path=d["final_path"],
+            state=state,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class CaptureManifest:
+    capture_id: str
+    session_id: str
+    operation: str
+    created_at: str
+    updated_at: str
+    status: Literal["staging", "failed", "committing", "committed"]
+    preserve_verbatim_input_on_failure: bool
+    failure_reason: Optional[str]
+    items: tuple[CaptureItem, ...]
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "CaptureManifest":
+        required = {
+            "capture_id",
+            "session_id",
+            "operation",
+            "created_at",
+            "updated_at",
+            "status",
+            "preserve_verbatim_input_on_failure",
+            "failure_reason",
+            "items",
+        }
+        missing = required - set(d)
+        if missing:
+            raise CaptureFormatError(
+                f"capture manifest missing fields: {sorted(missing)}"
+            )
+        status = d["status"]
+        if status not in {"staging", "failed", "committing", "committed"}:
+            raise CaptureFormatError(
+                "capture manifest status must be one of "
+                "'staging', 'failed', 'committing', 'committed'"
+            )
+        return cls(
+            capture_id=d["capture_id"],
+            session_id=d["session_id"],
+            operation=d["operation"],
+            created_at=d["created_at"],
+            updated_at=d["updated_at"],
+            status=status,
+            preserve_verbatim_input_on_failure=bool(
+                d["preserve_verbatim_input_on_failure"]
+            ),
+            failure_reason=d["failure_reason"],
+            items=tuple(CaptureItem.from_dict(item) for item in d["items"]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "capture_id": self.capture_id,
+            "session_id": self.session_id,
+            "operation": self.operation,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "status": self.status,
+            "preserve_verbatim_input_on_failure": self.preserve_verbatim_input_on_failure,
+            "failure_reason": self.failure_reason,
+            "items": [item.to_dict() for item in self.items],
+        }
+
+
+@dataclass
+class CaptureTransaction:
+    lock: LockHandle
+    manifest_path: str
+    manifest: CaptureManifest
+
+
+@dataclass(frozen=True)
+class CaptureRepairResult:
+    capture_id: Optional[str]
+    outcome: Literal[
+        "noop",
+        "discarded-draft",
+        "resumed-commit",
+        "cleaned-committed",
+    ]
+    detail: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def _capture_lock_path(do_work_root: PathLike) -> Path:
+    root = _coerce_do_work_root(do_work_root)
+    return root / ".locks" / "capture-global.lock"
+
+
+def _capture_staging_root(do_work_root: PathLike) -> Path:
+    root = _coerce_do_work_root(do_work_root)
+    return root / ".capture-staging"
+
+
+def _capture_stage_dir(do_work_root: PathLike, capture_id: str) -> Path:
+    return _capture_staging_root(do_work_root) / capture_id
+
+
+def _capture_manifest_path(stage_dir: PathLike) -> Path:
+    stage = Path(os.fspath(stage_dir))
+    return stage / "manifest.json"
+
+
+def _iter_capture_stage_dirs(do_work_root: PathLike) -> Iterable[Path]:
+    staging_root = _capture_staging_root(do_work_root)
+    if not staging_root.exists():
+        return ()
+    return sorted(
+        path for path in staging_root.iterdir()
+        if path.is_dir()
+    )
+
+
+def _read_capture_manifest(path: PathLike) -> CaptureManifest:
+    raw = Path(os.fspath(path)).read_text(encoding="utf-8")
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise CaptureFormatError(
+            f"capture manifest {os.fspath(path)!r} contains invalid JSON"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise CaptureFormatError(
+            f"capture manifest {os.fspath(path)!r} must be a JSON object"
+        )
+    return CaptureManifest.from_dict(parsed)
+
+
+def _write_capture_manifest(path: PathLike, manifest: CaptureManifest) -> None:
+    atomic_write(
+        path,
+        json.dumps(manifest.to_dict(), indent=2, sort_keys=True) + "\n",
+    )
+
+
+def _update_capture_manifest(
+    handle: CaptureTransaction,
+    manifest: CaptureManifest,
+) -> CaptureManifest:
+    _write_capture_manifest(handle.manifest_path, manifest)
+    handle.manifest = manifest
+    return manifest
+
+
+def _capture_item_source_path(item: CaptureItem) -> Path:
+    return Path(item.staged_path if item.state == "staged" else item.final_path)
+
+
+def _capture_item_exists(item: CaptureItem) -> tuple[bool, bool]:
+    source = Path(item.staged_path)
+    final = Path(item.final_path)
+    return source.exists(), final.exists()
+
+
+def _cleanup_capture_stage_dir(stage_dir: PathLike) -> None:
+    stage_path = Path(os.fspath(stage_dir))
+    staging_root = stage_path.parent
+    shutil.rmtree(stage_path)
+    try:
+        staging_root.rmdir()
+    except OSError:
+        pass
+
+
+def _capture_commit_ready_manifest(
+    manifest: CaptureManifest,
+) -> tuple[CaptureItem, tuple[CaptureItem, ...]]:
+    ur_items = tuple(item for item in manifest.items if item.kind == "ur-dir")
+    req_items = tuple(item for item in manifest.items if item.kind == "req")
+    if len(ur_items) != 1:
+        raise ConcurrencyError(
+            f"capture {manifest.capture_id} must stage exactly one UR folder "
+            f"before commit; found {len(ur_items)}"
+        )
+    if not req_items:
+        raise ConcurrencyError(
+            f"capture {manifest.capture_id} staged no REQ files"
+        )
+    return ur_items[0], req_items
+
+
+def _validate_capture_commit(manifest: CaptureManifest) -> None:
+    ur_item, req_items = _capture_commit_ready_manifest(manifest)
+    ur_staged_exists, ur_final_exists = _capture_item_exists(ur_item)
+    if ur_staged_exists and ur_final_exists:
+        raise ConcurrencyError(
+            f"capture {manifest.capture_id} found both staged and final UR copies for "
+            f"{ur_item.identifier}; refusing ambiguous commit state"
+        )
+    if not ur_staged_exists and not ur_final_exists:
+        raise ConcurrencyError(
+            f"capture {manifest.capture_id} lost both staged and final UR copies for "
+            f"{ur_item.identifier}; repair required"
+        )
+    ur_dir = Path(ur_item.staged_path if ur_staged_exists else ur_item.final_path)
+    input_path = ur_dir / "input.md"
+    if not input_path.exists():
+        raise ConcurrencyError(
+            f"capture {manifest.capture_id} cannot commit: expected "
+            f"{os.fspath(input_path)!r} to exist"
+        )
+
+    request_ids = tuple(_parse_ur_requests(input_path))
+    expected_request_ids = tuple(item.identifier for item in req_items)
+    if tuple(sorted(request_ids)) != tuple(sorted(expected_request_ids)):
+        raise ConcurrencyError(
+            f"capture {manifest.capture_id} cannot commit: UR requests array "
+            f"{list(request_ids)!r} does not match staged REQs "
+            f"{list(expected_request_ids)!r}"
+        )
+
+    for req_item in req_items:
+        staged_exists, final_exists = _capture_item_exists(req_item)
+        if staged_exists and final_exists:
+            raise ConcurrencyError(
+                f"capture {manifest.capture_id} found both staged and final copies for "
+                f"{req_item.identifier}; refusing ambiguous commit state"
+            )
+        if not staged_exists and not final_exists:
+            raise ConcurrencyError(
+                f"capture {manifest.capture_id} lost both staged and final copies for "
+                f"{req_item.identifier}; repair required"
+            )
+        req_path = Path(
+            req_item.staged_path if staged_exists else req_item.final_path
+        )
+        if not req_path.exists():
+            raise ConcurrencyError(
+                f"capture {manifest.capture_id} cannot commit: expected "
+                f"{os.fspath(req_path)!r} to exist"
+            )
+        frontmatter = _read_frontmatter(req_path)
+        if frontmatter.get("user_request") != ur_item.identifier:
+            raise ConcurrencyError(
+                f"capture {manifest.capture_id} cannot commit: "
+                f"{os.fspath(req_path)!r} has user_request "
+                f"{frontmatter.get('user_request')!r}, expected {ur_item.identifier!r}"
+            )
+        req_text = req_path.read_text(encoding="utf-8")
+        if "## Verification" not in req_text:
+            raise ConcurrencyError(
+                f"capture {manifest.capture_id} cannot commit: "
+                f"{os.fspath(req_path)!r} is missing its Verification section"
+            )
 
 def atomic_write(path: PathLike, content: str, *, mode: str = "w") -> None:
     """Write content to path via write-to-temp-then-rename.
@@ -2513,6 +2806,478 @@ def archive_completed_request(
     )
 
 
+def begin_capture_transaction(
+    do_work_root: PathLike,
+    *,
+    session_id: str,
+    operation: str = "do",
+    now: Optional[datetime] = None,
+    preserve_verbatim_input_on_failure: bool = True,
+) -> CaptureTransaction:
+    root = _coerce_do_work_root(do_work_root)
+    capture_lock = acquire_lock(
+        _capture_lock_path(root),
+        session_id=session_id,
+        operation=operation,
+        scope="capture-global",
+        now=now,
+    )
+
+    staging_root = _capture_staging_root(root)
+    os.makedirs(staging_root, exist_ok=True)
+
+    try:
+        blocking_stages: list[str] = []
+        for stage_dir in _iter_capture_stage_dirs(root):
+            manifest_path = _capture_manifest_path(stage_dir)
+            if not manifest_path.exists():
+                blocking_stages.append(
+                    f"{stage_dir.name} (missing manifest; run repair_capture_state)"
+                )
+                continue
+            manifest = _read_capture_manifest(manifest_path)
+            if manifest.status == "committed":
+                _cleanup_capture_stage_dir(stage_dir)
+                continue
+            blocking_stages.append(
+                f"{manifest.capture_id} ({manifest.status}; run repair_capture_state)"
+            )
+
+        if blocking_stages:
+            raise ConcurrencyError(
+                "capture start found pre-existing staged state:\n  - "
+                + "\n  - ".join(blocking_stages)
+            )
+
+        created_at = _iso(now or _utcnow())
+        capture_id = (
+            "CAP-"
+            + created_at.replace(":", "-")
+            + "-"
+            + secrets.token_hex(4)
+        )
+        stage_dir = _capture_stage_dir(root, capture_id)
+        stage_dir.mkdir(parents=True, exist_ok=False)
+        manifest = CaptureManifest(
+            capture_id=capture_id,
+            session_id=session_id,
+            operation=operation,
+            created_at=created_at,
+            updated_at=created_at,
+            status="staging",
+            preserve_verbatim_input_on_failure=preserve_verbatim_input_on_failure,
+            failure_reason=None,
+            items=(),
+        )
+        manifest_path = _capture_manifest_path(stage_dir)
+        _write_capture_manifest(manifest_path, manifest)
+        return CaptureTransaction(
+            lock=capture_lock,
+            manifest_path=os.fspath(manifest_path),
+            manifest=manifest,
+        )
+    except Exception:
+        release_lock(capture_lock)
+        raise
+
+
+def release_capture_transaction(handle: CaptureTransaction) -> None:
+    release_lock(handle.lock)
+
+
+def allocate_staged_ur_input(
+    transaction: CaptureTransaction,
+    *,
+    do_work_root: PathLike,
+    content: str,
+    now: Optional[datetime] = None,
+) -> AllocatedId:
+    root = _coerce_do_work_root(do_work_root)
+    manifest = _read_capture_manifest(transaction.manifest_path)
+    if manifest.status != "staging":
+        raise ConcurrencyError(
+            f"capture {manifest.capture_id} is {manifest.status}; cannot stage a UR"
+        )
+    if any(item.kind == "ur-dir" for item in manifest.items):
+        raise ConcurrencyError(
+            f"capture {manifest.capture_id} already staged a UR folder"
+        )
+
+    handle = _acquire_id_allocation_lock(
+        root,
+        namespace="ur",
+        session_id=manifest.session_id,
+        operation=manifest.operation,
+        now=now,
+    )
+    try:
+        number = _next_identifier_number(root, "ur")
+        identifier = _format_identifier("ur", number)
+        conflict = _find_conflicting_identifier_path(root, "ur", identifier)
+        if conflict is not None:
+            raise CollisionError(
+                f"allocate_staged_ur_input: next id {identifier} already exists at "
+                f"{os.fspath(conflict)!r}"
+            )
+
+        stage_dir = Path(transaction.manifest_path).parent
+        ur_dir = stage_dir / "user-requests" / identifier
+        input_path = ur_dir / "input.md"
+        try:
+            os.makedirs(ur_dir, exist_ok=False)
+        except FileExistsError as exc:
+            raise CollisionError(
+                f"allocate_staged_ur_input: destination directory "
+                f"{os.fspath(ur_dir)!r} already exists"
+            ) from exc
+
+        try:
+            _write_new_file(
+                input_path,
+                content,
+                transition=f"stage input for {identifier}",
+            )
+        except Exception:
+            try:
+                os.rmdir(ur_dir)
+            except OSError:
+                pass
+            raise
+
+        updated = CaptureManifest(
+            capture_id=manifest.capture_id,
+            session_id=manifest.session_id,
+            operation=manifest.operation,
+            created_at=manifest.created_at,
+            updated_at=_iso(now or _utcnow()),
+            status=manifest.status,
+            preserve_verbatim_input_on_failure=manifest.preserve_verbatim_input_on_failure,
+            failure_reason=manifest.failure_reason,
+            items=manifest.items + (
+                CaptureItem(
+                    kind="ur-dir",
+                    identifier=identifier,
+                    staged_path=os.fspath(ur_dir),
+                    final_path=os.fspath(root / "user-requests" / identifier),
+                ),
+            ),
+        )
+        _update_capture_manifest(transaction, updated)
+        return AllocatedId(
+            identifier=identifier,
+            number=number,
+            namespace="ur",
+            path=os.fspath(input_path),
+            lock_path=os.fspath(_id_lock_path(root, "ur")),
+        )
+    finally:
+        release_lock(handle)
+
+
+def allocate_staged_req_file(
+    transaction: CaptureTransaction,
+    *,
+    do_work_root: PathLike,
+    slug: str,
+    content: str,
+    now: Optional[datetime] = None,
+) -> AllocatedId:
+    root = _coerce_do_work_root(do_work_root)
+    manifest = _read_capture_manifest(transaction.manifest_path)
+    if manifest.status != "staging":
+        raise ConcurrencyError(
+            f"capture {manifest.capture_id} is {manifest.status}; cannot stage a REQ"
+        )
+
+    handle = _acquire_id_allocation_lock(
+        root,
+        namespace="req",
+        session_id=manifest.session_id,
+        operation=manifest.operation,
+        now=now,
+    )
+    try:
+        number = _next_identifier_number(root, "req")
+        identifier = _format_identifier("req", number)
+        conflict = _find_conflicting_identifier_path(root, "req", identifier)
+        if conflict is not None:
+            raise CollisionError(
+                f"allocate_staged_req_file: next id {identifier} already exists at "
+                f"{os.fspath(conflict)!r}"
+            )
+
+        stage_dir = Path(transaction.manifest_path).parent
+        target = stage_dir / "reqs" / f"{identifier}-{slug}.md"
+        _write_new_file(
+            target,
+            content,
+            transition=f"stage queue file for {identifier}",
+        )
+        updated = CaptureManifest(
+            capture_id=manifest.capture_id,
+            session_id=manifest.session_id,
+            operation=manifest.operation,
+            created_at=manifest.created_at,
+            updated_at=_iso(now or _utcnow()),
+            status=manifest.status,
+            preserve_verbatim_input_on_failure=manifest.preserve_verbatim_input_on_failure,
+            failure_reason=manifest.failure_reason,
+            items=manifest.items + (
+                CaptureItem(
+                    kind="req",
+                    identifier=identifier,
+                    staged_path=os.fspath(target),
+                    final_path=os.fspath(root / target.name),
+                ),
+            ),
+        )
+        _update_capture_manifest(transaction, updated)
+        return AllocatedId(
+            identifier=identifier,
+            number=number,
+            namespace="req",
+            path=os.fspath(target),
+            lock_path=os.fspath(_id_lock_path(root, "req")),
+        )
+    finally:
+        release_lock(handle)
+
+
+def abort_capture_transaction(
+    transaction: CaptureTransaction,
+    *,
+    reason: str,
+    now: Optional[datetime] = None,
+    preserve_draft: Optional[bool] = None,
+) -> CaptureManifest:
+    manifest = _read_capture_manifest(transaction.manifest_path)
+    if preserve_draft is None:
+        preserve_draft = manifest.preserve_verbatim_input_on_failure
+
+    updated_at = _iso(now or _utcnow())
+    if preserve_draft:
+        updated = CaptureManifest(
+            capture_id=manifest.capture_id,
+            session_id=manifest.session_id,
+            operation=manifest.operation,
+            created_at=manifest.created_at,
+            updated_at=updated_at,
+            status="failed",
+            preserve_verbatim_input_on_failure=manifest.preserve_verbatim_input_on_failure,
+            failure_reason=reason,
+            items=manifest.items,
+        )
+        return _update_capture_manifest(transaction, updated)
+
+    if manifest.status == "committing":
+        raise ConcurrencyError(
+            f"capture {manifest.capture_id} is already committing; use "
+            "repair_capture_state(...) to finish or inspect it"
+        )
+
+    _cleanup_capture_stage_dir(Path(transaction.manifest_path).parent)
+    updated = CaptureManifest(
+        capture_id=manifest.capture_id,
+        session_id=manifest.session_id,
+        operation=manifest.operation,
+        created_at=manifest.created_at,
+        updated_at=updated_at,
+        status="failed",
+        preserve_verbatim_input_on_failure=manifest.preserve_verbatim_input_on_failure,
+        failure_reason=reason,
+        items=manifest.items,
+    )
+    transaction.manifest = updated
+    return updated
+
+
+def commit_capture_transaction(
+    transaction: CaptureTransaction,
+    *,
+    now: Optional[datetime] = None,
+) -> CaptureManifest:
+    manifest = _read_capture_manifest(transaction.manifest_path)
+    if manifest.status == "failed":
+        raise ConcurrencyError(
+            f"capture {manifest.capture_id} is marked failed; repair or discard it "
+            "before retrying"
+        )
+
+    _validate_capture_commit(manifest)
+    if manifest.status != "committing":
+        manifest = CaptureManifest(
+            capture_id=manifest.capture_id,
+            session_id=manifest.session_id,
+            operation=manifest.operation,
+            created_at=manifest.created_at,
+            updated_at=_iso(now or _utcnow()),
+            status="committing",
+            preserve_verbatim_input_on_failure=manifest.preserve_verbatim_input_on_failure,
+            failure_reason=manifest.failure_reason,
+            items=manifest.items,
+        )
+        manifest = _update_capture_manifest(transaction, manifest)
+
+    items = list(manifest.items)
+    for index, item in enumerate(items):
+        if item.state == "published":
+            continue
+
+        staged_exists, final_exists = _capture_item_exists(item)
+        if staged_exists and final_exists:
+            raise ConcurrencyError(
+                f"capture {manifest.capture_id} found both staged and final copies for "
+                f"{item.identifier}; refusing ambiguous commit state"
+            )
+        if not staged_exists and not final_exists:
+            raise ConcurrencyError(
+                f"capture {manifest.capture_id} lost both staged and final copies for "
+                f"{item.identifier}; repair required"
+            )
+
+        if staged_exists and not final_exists:
+            os.makedirs(Path(item.final_path).parent, exist_ok=True)
+            atomic_rename(
+                item.staged_path,
+                item.final_path,
+                transition=f"capture commit for {item.identifier}",
+            )
+
+        items[index] = CaptureItem(
+            kind=item.kind,
+            identifier=item.identifier,
+            staged_path=item.staged_path,
+            final_path=item.final_path,
+            state="published",
+        )
+        manifest = CaptureManifest(
+            capture_id=manifest.capture_id,
+            session_id=manifest.session_id,
+            operation=manifest.operation,
+            created_at=manifest.created_at,
+            updated_at=_iso(now or _utcnow()),
+            status="committing",
+            preserve_verbatim_input_on_failure=manifest.preserve_verbatim_input_on_failure,
+            failure_reason=manifest.failure_reason,
+            items=tuple(items),
+        )
+        manifest = _update_capture_manifest(transaction, manifest)
+
+    manifest = CaptureManifest(
+        capture_id=manifest.capture_id,
+        session_id=manifest.session_id,
+        operation=manifest.operation,
+        created_at=manifest.created_at,
+        updated_at=_iso(now or _utcnow()),
+        status="committed",
+        preserve_verbatim_input_on_failure=manifest.preserve_verbatim_input_on_failure,
+        failure_reason=manifest.failure_reason,
+        items=manifest.items,
+    )
+    return _update_capture_manifest(transaction, manifest)
+
+
+def repair_capture_state(
+    do_work_root: PathLike,
+    *,
+    session_id: str,
+    operation: str = "do",
+    capture_id: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> CaptureRepairResult:
+    root = _coerce_do_work_root(do_work_root)
+    current_time = now or _utcnow()
+    lock_path = _capture_lock_path(root)
+    try:
+        capture_lock = acquire_lock(
+            lock_path,
+            session_id=session_id,
+            operation=operation,
+            scope="capture-global",
+            now=current_time,
+        )
+    except LockHeldError as exc:
+        verdict = classify_lock(exc.holder, now=current_time)
+        if verdict != "orphaned":
+            raise ConcurrencyError(
+                "capture repair refuses to steal a live or ambiguous capture lock:\n"
+                f"  holder: {exc.holder.session_id}\n"
+                f"  verdict: {verdict}"
+            ) from exc
+        os.unlink(lock_path)
+        capture_lock = acquire_lock(
+            lock_path,
+            session_id=session_id,
+            operation=operation,
+            scope="capture-global",
+            now=current_time,
+        )
+
+    try:
+        stage_dirs = list(_iter_capture_stage_dirs(root))
+        if not stage_dirs:
+            return CaptureRepairResult(
+                capture_id=None,
+                outcome="noop",
+                detail="no capture staging state found",
+            )
+
+        if capture_id is not None:
+            stage_dir = _capture_stage_dir(root, capture_id)
+            if stage_dir not in stage_dirs:
+                return CaptureRepairResult(
+                    capture_id=capture_id,
+                    outcome="noop",
+                    detail=f"{capture_id} not present under .capture-staging/",
+                )
+        else:
+            if len(stage_dirs) > 1:
+                raise ConcurrencyError(
+                    "capture repair found multiple staged captures; specify capture_id: "
+                    + ", ".join(path.name for path in stage_dirs)
+                )
+            stage_dir = stage_dirs[0]
+
+        manifest_path = _capture_manifest_path(stage_dir)
+        if not manifest_path.exists():
+            raise ConcurrencyError(
+                f"capture stage {stage_dir.name} is missing manifest.json; "
+                "manual inspection required"
+            )
+
+        manifest = _read_capture_manifest(manifest_path)
+        if manifest.status == "committed":
+            _cleanup_capture_stage_dir(stage_dir)
+            return CaptureRepairResult(
+                capture_id=manifest.capture_id,
+                outcome="cleaned-committed",
+                detail="removed committed staging leftovers",
+            )
+
+        if manifest.status in {"staging", "failed"}:
+            _cleanup_capture_stage_dir(stage_dir)
+            return CaptureRepairResult(
+                capture_id=manifest.capture_id,
+                outcome="discarded-draft",
+                detail="discarded staged draft and released reserved IDs",
+            )
+
+        transaction = CaptureTransaction(
+            lock=capture_lock,
+            manifest_path=os.fspath(manifest_path),
+            manifest=manifest,
+        )
+        commit_capture_transaction(transaction, now=current_time)
+        _cleanup_capture_stage_dir(stage_dir)
+        return CaptureRepairResult(
+            capture_id=manifest.capture_id,
+            outcome="resumed-commit",
+            detail="finished an interrupted capture commit and cleaned staging",
+        )
+    finally:
+        release_lock(capture_lock)
+
+
 def allocate_ur_input(
     do_work_root: PathLike,
     *,
@@ -2626,6 +3391,7 @@ __all__ = [
     "ConcurrencyError",
     "LockHeldError",
     "ClaimFormatError",
+    "CaptureFormatError",
     "ClaimHeldError",
     "SessionClaimConflictError",
     "ScopeError",
@@ -2653,6 +3419,10 @@ __all__ = [
     "ParentArchivalResult",
     "RequestArchivalResult",
     "ScopedStageResult",
+    "CaptureItem",
+    "CaptureManifest",
+    "CaptureTransaction",
+    "CaptureRepairResult",
     "validate_scope",
     "acquire_lock",
     "acquire_verification_lock",
@@ -2687,6 +3457,13 @@ __all__ = [
     "archive_user_request_if_complete",
     "archive_legacy_context_if_complete",
     "archive_completed_request",
+    "begin_capture_transaction",
+    "release_capture_transaction",
+    "allocate_staged_ur_input",
+    "allocate_staged_req_file",
+    "abort_capture_transaction",
+    "commit_capture_transaction",
+    "repair_capture_state",
     "allocate_ur_input",
     "allocate_req_file",
 ]

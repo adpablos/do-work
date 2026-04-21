@@ -4,6 +4,16 @@ What's new, what's better, what's different. Most recent stuff on top.
 
 ---
 
+## 0.22.0 — The Safety Net (2026-04-20)
+
+Capture stopped leaking half-finished state into the queue. New requests now stage privately, get verified before publish, and leave a readable draft or resumable manifest behind if the session dies at the wrong moment.
+
+- Added staged capture transaction + repair helpers in `lib/concurrency.py`, including draft-preserving aborts and resumable publish after a mid-commit crash
+- Reserved UR/REQ IDs while a staged draft exists, and documented the release policy: discard frees them, interrupted publish resumes forward
+- Added regression coverage for staged commit, fail-loud partial-state detection, ID reuse after explicit discard, and crash recovery during publish
+- Rewrote the do-action and concurrency-primitives docs around the staged Step 5 / Step 5.5 / Step 5.6 flow
+- Archived `REQ-008` as completed
+
 ## 0.21.0 — The Door Latch (2026-04-20)
 
 Verify runs stop stepping on each other now. A REQ under verification gets its own named document lock, the verification block rewrites atomically, and the loser in a race gets told exactly who is holding the file instead of quietly clobbering output.

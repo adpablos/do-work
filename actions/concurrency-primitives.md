@@ -4,7 +4,7 @@
 
 ## What This Provides
 
-A filesystem-only toolbox that lets sessions coordinate without races: exclusive lockfiles, atomic renames, atomic writes, atomic REQ/UR ID allocation for capture, a claim file format, and a catalog of canonical lock scopes. All primitives are stdlib-only Python 3 and consult the session-identity record (REQ-001) so every lock knows which session holds it.
+A filesystem-only toolbox that lets sessions coordinate without races: exclusive lockfiles, atomic renames, atomic writes, atomic REQ/UR ID allocation for capture, staged capture transactions with explicit repair, a claim file format, and a catalog of canonical lock scopes. All primitives are stdlib-only Python 3 and consult the session-identity record (REQ-001) so every lock knows which session holds it.
 
 This is a **library of primitives**, not a policy. Individual actions decide when and at what scope to use each primitive (see REQ-003..REQ-010). The library does not assume. The rule: **never hand-roll a lock, a claim, or a state transition — call the library.**
 
@@ -96,7 +96,7 @@ Cross-host cases (`info.hostname != local hostname`) always return `stale` — U
 
 ### 5. Atomic ID Allocation
 
-**Contract:** Capture never hand-scans for `REQ-NNN` / `UR-NNN`. It calls the allocator, which acquires the namespace-specific ID lock, scans every authoritative location for that namespace, writes the placeholder on disk, and only then releases the lock.
+**Contract:** Capture never hand-scans for `REQ-NNN` / `UR-NNN`. It calls the allocator, which acquires the namespace-specific ID lock, scans every authoritative location for that namespace, writes the reservation or placeholder on disk, and only then releases the lock.
 
 **API:**
 
@@ -111,8 +111,8 @@ Cross-host cases (`info.hostname != local hostname`) always return `stale` — U
 
 **Authoritative scan coverage:**
 
-- `allocate_req_file(...)` scans `do-work/REQ-*.md`, `do-work/working/REQ-*.md`, `do-work/archive/REQ-*.md`, and `do-work/archive/UR-*/REQ-*.md`
-- `allocate_ur_input(...)` scans `do-work/user-requests/UR-*` and `do-work/archive/UR-*`
+- `allocate_req_file(...)` scans `do-work/REQ-*.md`, `do-work/working/REQ-*.md`, `do-work/archive/REQ-*.md`, `do-work/archive/UR-*/REQ-*.md`, and staged capture reservations under `do-work/.capture-staging/*/reqs/REQ-*.md`
+- `allocate_ur_input(...)` scans `do-work/user-requests/UR-*`, `do-work/archive/UR-*`, and staged capture reservations under `do-work/.capture-staging/*/user-requests/UR-*`
 
 **Write-then-release guarantee:**
 
@@ -120,6 +120,37 @@ Cross-host cases (`info.hostname != local hostname`) always return `stale` — U
 - REQ allocation is not complete until `do-work/REQ-NNN-slug.md` exists on disk.
 - If the placeholder write fails, the allocator releases the lock and removes any directory it created.
 - If the "next" ID already exists anywhere authoritative, allocation fails loudly with the conflicting path.
+
+**ID release policy (REQ-008):**
+
+- A staged capture reserves its UR/REQ IDs while its `CAP-*` staging folder exists.
+- If the capture fails and preserves a recoverable draft, those IDs stay out of the pool until an explicit repair/discard step removes the staging folder.
+- If repair discards the staging folder cleanly before anything is published, the IDs return to the pool and may be reused.
+- If commit was interrupted after publish began, repair resumes the publish instead of trying to "un-burn" partially-visible IDs.
+
+### 5.5 Capture Staging + Explicit Repair
+
+**Contract:** The do action never publishes UR/REQ files directly anymore. It stages the whole capture under `do-work/.capture-staging/CAP-*/`, runs Step 5.5 verification there, and only then publishes each final path via `atomic_rename(...)`. A crash before publish leaves a readable draft manifest; a crash during publish leaves a resumable `committing` manifest. Nothing is silently ignored.
+
+**API:**
+
+- `begin_capture_transaction(do_work_root, *, session_id, operation="do", now=None, preserve_verbatim_input_on_failure=True) -> CaptureTransaction`
+- `allocate_staged_ur_input(transaction, *, do_work_root, content, now=None) -> AllocatedId`
+- `allocate_staged_req_file(transaction, *, do_work_root, slug, content, now=None) -> AllocatedId`
+- `commit_capture_transaction(transaction, *, now=None) -> CaptureManifest`
+- `abort_capture_transaction(transaction, *, reason, now=None, preserve_draft=None) -> CaptureManifest`
+- `repair_capture_state(do_work_root, *, session_id, operation="do", capture_id=None, now=None) -> CaptureRepairResult`
+- `release_capture_transaction(transaction)`
+
+**Behavior notes:**
+
+- `begin_capture_transaction(...)` takes `do-work/.locks/capture-global.lock` and refuses to start if any non-committed `CAP-*` staging folder already exists. That is the fail-loud detection path for pre-existing partial state.
+- Staging manifests live at `do-work/.capture-staging/CAP-*/manifest.json` and are intentionally `cat`-readable.
+- Staged UR content lives under `.../user-requests/UR-NNN/input.md`; staged REQs live under `.../reqs/REQ-NNN-slug.md`. Final destinations do not appear until commit.
+- `commit_capture_transaction(...)` validates the atomic unit before publishing: exactly one staged UR, at least one staged REQ, the UR `requests: [...]` array matches the staged REQ IDs, every staged REQ points back to the staged UR via `user_request`, and every staged REQ already contains its `## Verification` section from Step 5.5.
+- `abort_capture_transaction(...)` defaults to preserving the staged draft. This keeps the verbatim UR input on disk for explicit recovery instead of deleting the evidence.
+- `repair_capture_state(...)` is idempotent. On a clean tree it returns `noop`. On a failed draft it discards the staging folder. On an interrupted `committing` capture it resumes publish and then cleans the staging leftovers.
+- Committed staging leftovers are safe to delete and are automatically cleaned the next time a new capture transaction begins.
 
 ### 6. Work/Verify Claim File Format
 
@@ -259,6 +290,7 @@ Claim lifecycle (when to create, refresh, release) is **not** defined here — t
 
 | Scope name             | Used by     | Purpose                                                           |
 |------------------------|-------------|-------------------------------------------------------------------|
+| `capture-global`       | REQ-008     | Serializes staged capture start/repair and blocks stale partials. |
 | `id-allocation:req`    | REQ-003     | Short lock for atomic REQ ID allocation during capture.           |
 | `id-allocation:ur`     | REQ-003     | Short lock for atomic UR ID allocation during capture.            |
 | `req-claim:<REQ-id>`   | REQ-004     | Per-REQ lock when claiming a queue entry.                         |

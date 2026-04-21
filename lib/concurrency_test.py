@@ -12,11 +12,16 @@ from typing import Optional
 from unittest import mock
 
 from lib.concurrency import (
+    abort_capture_transaction,
     AtomicWriteError,
+    begin_capture_transaction,
     CleanupClaimHandle,
     CleanupClaimRecord,
+    commit_capture_transaction,
     ConcurrencyError,
     acquire_verification_lock,
+    allocate_staged_req_file,
+    allocate_staged_ur_input,
     archive_completed_request,
     archive_legacy_context_if_complete,
     archive_user_request_if_complete,
@@ -59,9 +64,11 @@ from lib.concurrency import (
     refresh_claim_heartbeat,
     release_cleanup,
     release_claim,
+    release_capture_transaction,
     refresh_heartbeat,
     release_lock,
     replace_markdown_section,
+    repair_capture_state,
     SessionClaimConflictError,
     verify_and_stage_claim_scope,
     verification_lock_path,
@@ -667,6 +674,269 @@ class ConcurrencyPrimitivesTest(unittest.TestCase):
         )
         for _, _, path in successes:
             self.assertTrue(Path(path).exists())
+
+    def test_capture_transaction_stages_then_commits_to_final_locations(self) -> None:
+        do_work_root = self.root / "do-work"
+        transaction = begin_capture_transaction(
+            do_work_root,
+            session_id="session-1",
+            operation="do",
+            now=datetime(2026, 4, 20, 23, 0, tzinfo=timezone.utc),
+        )
+        self.addCleanup(release_capture_transaction, transaction)
+
+        ur = allocate_staged_ur_input(
+            transaction,
+            do_work_root=do_work_root,
+            content=(
+                "---\n"
+                "id: UR-001\n"
+                "title: Example\n"
+                "created_at: 2026-04-20T23:00:00Z\n"
+                "requests: []\n"
+                "word_count: 2\n"
+                "---\n\n"
+                "# Example\n\n"
+                "## Full Verbatim Input\n\n"
+                "ship it\n"
+            ),
+            now=datetime(2026, 4, 20, 23, 0, tzinfo=timezone.utc),
+        )
+        req = allocate_staged_req_file(
+            transaction,
+            do_work_root=do_work_root,
+            slug="ship-it",
+            content=(
+                "---\n"
+                "id: REQ-001\n"
+                "title: Ship it\n"
+                "status: pending\n"
+                "created_at: 2026-04-20T23:00:00Z\n"
+                "user_request: UR-001\n"
+                "---\n\n"
+                "# Ship it\n\n"
+                "## What\n\n"
+                "Ship it.\n\n"
+                "## Verification\n\n"
+                "*Verified by verify-request action*\n"
+            ),
+            now=datetime(2026, 4, 20, 23, 0, 1, tzinfo=timezone.utc),
+        )
+
+        atomic_write(
+            ur.path,
+            (
+                "---\n"
+                "id: UR-001\n"
+                "title: Example\n"
+                "created_at: 2026-04-20T23:00:00Z\n"
+                "requests: [REQ-001]\n"
+                "word_count: 2\n"
+                "---\n\n"
+                "# Example\n\n"
+                "## Full Verbatim Input\n\n"
+                "ship it\n"
+            ),
+        )
+
+        manifest = commit_capture_transaction(
+            transaction,
+            now=datetime(2026, 4, 20, 23, 0, 2, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(manifest.status, "committed")
+        self.assertTrue((do_work_root / "user-requests" / ur.identifier / "input.md").exists())
+        self.assertTrue((do_work_root / f"{req.identifier}-ship-it.md").exists())
+        self.assertFalse(Path(req.path).exists())
+        self.assertFalse(Path(ur.path).exists())
+
+    def test_capture_start_fails_loud_when_failed_stage_exists(self) -> None:
+        do_work_root = self.root / "do-work"
+        transaction = begin_capture_transaction(
+            do_work_root,
+            session_id="session-1",
+            operation="do",
+            now=datetime(2026, 4, 20, 23, 5, tzinfo=timezone.utc),
+        )
+        ur = allocate_staged_ur_input(
+            transaction,
+            do_work_root=do_work_root,
+            content="---\nid: UR-001\ntitle: Draft\ncreated_at: 2026-04-20T23:05:00Z\nrequests: []\nword_count: 1\n---\n",
+            now=datetime(2026, 4, 20, 23, 5, tzinfo=timezone.utc),
+        )
+        abort_capture_transaction(
+            transaction,
+            reason="simulated failure",
+            now=datetime(2026, 4, 20, 23, 5, 1, tzinfo=timezone.utc),
+            preserve_draft=True,
+        )
+        release_capture_transaction(transaction)
+
+        with self.assertRaises(ConcurrencyError) as ctx:
+            begin_capture_transaction(
+                do_work_root,
+                session_id="session-2",
+                operation="do",
+                now=datetime(2026, 4, 20, 23, 6, tzinfo=timezone.utc),
+            )
+
+        self.assertIn("repair_capture_state", str(ctx.exception))
+        self.assertIn("CAP-", str(ctx.exception))
+        self.assertTrue((do_work_root / ".capture-staging").exists())
+        self.assertTrue(Path(ur.path).exists())
+
+    def test_repair_capture_state_discards_failed_stage_and_releases_reserved_ids(self) -> None:
+        do_work_root = self.root / "do-work"
+        transaction = begin_capture_transaction(
+            do_work_root,
+            session_id="session-1",
+            operation="do",
+            now=datetime(2026, 4, 20, 23, 10, tzinfo=timezone.utc),
+        )
+        ur = allocate_staged_ur_input(
+            transaction,
+            do_work_root=do_work_root,
+            content="---\nid: UR-001\ntitle: Draft\ncreated_at: 2026-04-20T23:10:00Z\nrequests: []\nword_count: 1\n---\n",
+            now=datetime(2026, 4, 20, 23, 10, tzinfo=timezone.utc),
+        )
+        req = allocate_staged_req_file(
+            transaction,
+            do_work_root=do_work_root,
+            slug="draft",
+            content="---\nid: REQ-001\ntitle: Draft\nstatus: pending\ncreated_at: 2026-04-20T23:10:00Z\nuser_request: UR-001\n---\n",
+            now=datetime(2026, 4, 20, 23, 10, 1, tzinfo=timezone.utc),
+        )
+        abort_capture_transaction(
+            transaction,
+            reason="simulated failure",
+            now=datetime(2026, 4, 20, 23, 10, 2, tzinfo=timezone.utc),
+            preserve_draft=True,
+        )
+        release_capture_transaction(transaction)
+
+        repair = repair_capture_state(
+            do_work_root,
+            session_id="session-2",
+            operation="do",
+            now=datetime(2026, 4, 20, 23, 11, tzinfo=timezone.utc),
+        )
+        self.assertEqual(repair.outcome, "discarded-draft")
+        self.assertFalse((do_work_root / ".capture-staging").exists())
+
+        replacement_ur = allocate_ur_input(
+            do_work_root,
+            session_id="session-3",
+            operation="do",
+            content="fresh\n",
+        )
+        replacement_req = allocate_req_file(
+            do_work_root,
+            session_id="session-3",
+            operation="do",
+            slug="fresh",
+            content="fresh\n",
+        )
+        self.assertEqual(replacement_ur.identifier, ur.identifier)
+        self.assertEqual(replacement_req.identifier, req.identifier)
+
+    def test_repair_capture_state_resumes_commit_after_crash_mid_publish(self) -> None:
+        do_work_root = self.root / "do-work"
+        transaction = begin_capture_transaction(
+            do_work_root,
+            session_id="session-1",
+            operation="do",
+            now=datetime(2026, 4, 20, 23, 20, tzinfo=timezone.utc),
+        )
+        self.addCleanup(
+            lambda: release_capture_transaction(transaction)
+            if Path(transaction.lock.path).exists()
+            else None
+        )
+        ur = allocate_staged_ur_input(
+            transaction,
+            do_work_root=do_work_root,
+            content=(
+                "---\n"
+                "id: UR-001\n"
+                "title: Crashy\n"
+                "created_at: 2026-04-20T23:20:00Z\n"
+                "requests: []\n"
+                "word_count: 2\n"
+                "---\n\n"
+                "# Crashy\n\n"
+                "## Full Verbatim Input\n\n"
+                "crash now\n"
+            ),
+            now=datetime(2026, 4, 20, 23, 20, tzinfo=timezone.utc),
+        )
+        req = allocate_staged_req_file(
+            transaction,
+            do_work_root=do_work_root,
+            slug="crashy",
+            content=(
+                "---\n"
+                "id: REQ-001\n"
+                "title: Crashy\n"
+                "status: pending\n"
+                "created_at: 2026-04-20T23:20:00Z\n"
+                "user_request: UR-001\n"
+                "---\n\n"
+                "# Crashy\n\n"
+                "## What\n\n"
+                "Crash now.\n\n"
+                "## Verification\n\n"
+                "*Verified by verify-request action*\n"
+            ),
+            now=datetime(2026, 4, 20, 23, 20, 1, tzinfo=timezone.utc),
+        )
+        atomic_write(
+            ur.path,
+            (
+                "---\n"
+                "id: UR-001\n"
+                "title: Crashy\n"
+                "created_at: 2026-04-20T23:20:00Z\n"
+                "requests: [REQ-001]\n"
+                "word_count: 2\n"
+                "---\n\n"
+                "# Crashy\n\n"
+                "## Full Verbatim Input\n\n"
+                "crash now\n"
+            ),
+        )
+
+        real_atomic_rename = atomic_rename
+        rename_calls = {"count": 0}
+
+        def crash_after_first_publish(src, dst, *, transition):
+            rename_calls["count"] += 1
+            real_atomic_rename(src, dst, transition=transition)
+            if rename_calls["count"] == 1:
+                raise RuntimeError("simulated crash after publish")
+
+        with mock.patch(
+            "lib.concurrency.atomic_rename",
+            side_effect=crash_after_first_publish,
+        ):
+            with self.assertRaises(RuntimeError):
+                commit_capture_transaction(
+                    transaction,
+                    now=datetime(2026, 4, 20, 23, 20, 2, tzinfo=timezone.utc),
+                )
+
+        release_capture_transaction(transaction)
+
+        repair = repair_capture_state(
+            do_work_root,
+            session_id="session-2",
+            operation="do",
+            now=datetime(2026, 4, 20, 23, 21, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(repair.outcome, "resumed-commit")
+        self.assertTrue((do_work_root / "user-requests" / ur.identifier / "input.md").exists())
+        self.assertTrue((do_work_root / f"{req.identifier}-crashy.md").exists())
+        self.assertFalse((do_work_root / ".capture-staging").exists())
 
     def test_claim_round_trip(self) -> None:
         claim = ClaimRecord(
